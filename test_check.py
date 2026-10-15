@@ -57,13 +57,16 @@ def test_models():
         cli="audiocpp_cli",
         model_key="qwen3_tts_voicedesign",
         model_path="models/qwen3-tts.gguf",
-        backend="cuda",
+        backend="best",
         text="Testing Qwen",
         speaker_type=speaker,
         output_path="out2.wav",
+        device_index=1,
     )
     assert "--task" in cmd_qwen and cmd_qwen[cmd_qwen.index("--task") + 1] == "vdes"
     assert "--instruct" in cmd_qwen, "Qwen VoiceDesign must use --instruct"
+    assert "--device" in cmd_qwen and cmd_qwen[cmd_qwen.index("--device") + 1] == "1"
+    assert "--backend" in cmd_qwen and cmd_qwen[cmd_qwen.index("--backend") + 1] == "best"
     print("[OK] Model templates and CLI argument generation verified.")
 
 

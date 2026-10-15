@@ -77,7 +77,7 @@ def build_allocation(model_key: str) -> dict:
             "name": gpu.name,
             "vram_mb": gpu.vram_mb,
             "workers": w,
-            "backend": "cuda",
+            "backend": "best",
         })
         total += w
 

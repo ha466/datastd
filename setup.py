@@ -20,12 +20,23 @@ from urllib.request import urlretrieve
 
 AUDIO_BINARIES = {
     "linux": {
-        "url": "https://github.com/0xShug0/audio.cpp/releases/download/v0.9.1/audio-v0.9.1-bin-ubuntu-x64-cuda12.8-colab.tar.gz",
-        "filename": "audio-v0.9.1-bin-ubuntu-x64-cuda12.8-colab.tar.gz",
+        "url": "https://github.com/0xShug0/audio.cpp/releases/download/v0.9.1/audio-v0.9.1-bin-ubuntu-x64-vulkan.tar.gz",
+        "filename": "audio-v0.9.1-bin-ubuntu-x64-vulkan.tar.gz",
     },
     "windows": {
         "url": "https://github.com/0xShug0/audio.cpp/releases/download/v0.9.1/audio-v0.9.1-bin-windows-x64-cuda12.4.zip",
         "filename": "audio-v0.9.1-bin-windows-x64-cuda12.4.zip",
+    },
+}
+
+AUDIO_CPU_BINARIES = {
+    "linux": {
+        "url": "https://github.com/0xShug0/audio.cpp/releases/download/v0.9.1/audio-v0.9.1-bin-ubuntu-x64-cpu.tar.gz",
+        "filename": "audio-v0.9.1-bin-ubuntu-x64-cpu.tar.gz",
+    },
+    "windows": {
+        "url": "https://github.com/0xShug0/audio.cpp/releases/download/v0.9.1/audio-v0.9.1-bin-windows-x64-cpu.zip",
+        "filename": "audio-v0.9.1-bin-windows-x64-cpu.zip",
     },
 }
 
@@ -98,18 +109,28 @@ def _extract_archive(archive_path: Path, dest_dir: Path):
 
 
 def setup_binaries(platform: str, use_cpu: bool = False):
-    """Download and extract both audio.cpp and llama.cpp binaries (CUDA GPU accelerated by default)."""
+    """Download and extract both audio.cpp and llama.cpp binaries (GPU accelerated by default)."""
     bin_dir = Path("bin")
     bin_dir.mkdir(exist_ok=True)
 
-    # 1. audio.cpp (CUDA GPU build)
-    audio_info = AUDIO_BINARIES[platform]
+    cli_name = "audiocpp_cli.exe" if platform == "windows" else "audiocpp_cli"
+    llama_name = "llama-server.exe" if platform == "windows" else "llama-server"
+
+    # Pre-clean collisions if a directory exists with the same name as binary
+    for name in (cli_name, llama_name):
+        target = bin_dir / name
+        if target.is_dir() and not target.is_symlink():
+            shutil.rmtree(target)
+
+    # 1. audio.cpp (GPU build by default)
+    audio_info = AUDIO_CPU_BINARIES[platform] if use_cpu else AUDIO_BINARIES[platform]
     audio_archive = bin_dir / audio_info["filename"]
+    gpu_label = "CPU-only" if use_cpu else "GPU accelerated"
     if not audio_archive.exists():
-        print(f"\n[1/4] Downloading audio.cpp binary ({platform} CUDA GPU)...")
+        print(f"\n[1/4] Downloading audio.cpp binary ({platform} {gpu_label})...")
         download(audio_info["url"], str(audio_archive))
     else:
-        print(f"\n[1/4] audio.cpp binary archive already exists: {audio_archive}")
+        print(f"\n[1/4] audio.cpp binary archive already exists ({gpu_label}): {audio_archive}")
 
     print(f"  Extracting audio.cpp to {bin_dir}/...")
     _extract_archive(audio_archive, bin_dir)
@@ -127,10 +148,7 @@ def setup_binaries(platform: str, use_cpu: bool = False):
     print(f"  Extracting llama.cpp to {bin_dir}/...")
     _extract_archive(llama_archive, bin_dir)
 
-    # Flatten and set executable permissions
-    cli_name = "audiocpp_cli.exe" if platform == "windows" else "audiocpp_cli"
-    llama_name = "llama-server.exe" if platform == "windows" else "llama-server"
-
+    # Flatten binaries and libraries to bin_dir and set executable permissions
     for root, dirs, files in os.walk(bin_dir):
         for f in files:
             if f in (cli_name, llama_name) or f.endswith(".dll") or ".so" in f:
@@ -138,7 +156,9 @@ def setup_binaries(platform: str, use_cpu: bool = False):
                 dst = bin_dir / f
                 if src.resolve() != dst.resolve():
                     try:
-                        if dst.is_symlink() or dst.exists():
+                        if dst.is_dir() and not dst.is_symlink():
+                            shutil.rmtree(dst)
+                        elif dst.is_symlink() or dst.exists():
                             dst.unlink()
                         shutil.copy2(src, dst, follow_symlinks=True)
                     except Exception:
@@ -149,8 +169,39 @@ def setup_binaries(platform: str, use_cpu: bool = False):
                     except Exception:
                         pass
 
-    print(f"  [OK] audio.cpp CLI ready: {bin_dir / cli_name}")
-    print(f"  [OK] llama-server ready:  {bin_dir / llama_name}")
+    # Verify and fallback search for binaries
+    target_cli = bin_dir / cli_name
+    if not target_cli.is_file():
+        for p in bin_dir.rglob(cli_name):
+            if p.is_file():
+                if target_cli.is_dir() and not target_cli.is_symlink():
+                    shutil.rmtree(target_cli)
+                elif target_cli.is_symlink() or target_cli.exists():
+                    target_cli.unlink()
+                shutil.copy2(p, target_cli, follow_symlinks=True)
+                break
+
+    target_llama = bin_dir / llama_name
+    if not target_llama.is_file():
+        for p in bin_dir.rglob(llama_name):
+            if p.is_file():
+                if target_llama.is_dir() and not target_llama.is_symlink():
+                    shutil.rmtree(target_llama)
+                elif target_llama.is_symlink() or target_llama.exists():
+                    target_llama.unlink()
+                shutil.copy2(p, target_llama, follow_symlinks=True)
+                break
+
+    if platform != "windows":
+        for target in (target_cli, target_llama):
+            if target.is_file():
+                try:
+                    os.chmod(target, 0o755)
+                except Exception:
+                    pass
+
+    print(f"  [OK] audio.cpp CLI ready: {target_cli}")
+    print(f"  [OK] llama-server ready:  {target_llama}")
 
 
 def setup_models(targets: dict[str, str]):

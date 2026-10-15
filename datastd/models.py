@@ -126,6 +126,7 @@ def build_cli_args(
     text: str,
     speaker_type: str,
     output_path: str,
+    device_index: int = -1,
 ) -> list[str]:
     """Build the exact command-line arguments for audiocpp_cli."""
     m = MODELS[model_key]
@@ -141,6 +142,9 @@ def build_cli_args(
         "--backend", backend,
         "--text", text,
     ]
+
+    if device_index >= 0:
+        cmd.extend(["--device", str(device_index)])
 
     if m.get("instruct_style") == "request_option":
         cmd.extend(["--request-option", f"instruct={instruct}"])

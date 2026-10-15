@@ -133,10 +133,21 @@ def _find_cli() -> str:
     ])
     for c in candidates:
         if c.exists() and c.is_file():
+            if os.name != "nt":
+                try:
+                    os.chmod(c, 0o755)
+                except Exception:
+                    pass
             return str(c.resolve())
+
     # Fall back to PATH
     which_bin = shutil.which("audiocpp_cli")
-    if which_bin:
+    if which_bin and Path(which_bin).is_file():
+        if os.name != "nt":
+            try:
+                os.chmod(which_bin, 0o755)
+            except Exception:
+                pass
         return which_bin
     return "audiocpp_cli"
 
@@ -157,6 +168,9 @@ async def _synthesize_one(
 ) -> bool:
     """Run a single audiocpp_cli TTS call."""
     cli_path = Path(cli)
+    if cli_path.is_dir():
+        log.error(f"Cannot execute TTS: {cli} is a directory, not an executable file!")
+        return False
     if os.name != "nt" and cli_path.exists():
         try:
             os.chmod(cli_path, 0o755)
@@ -171,10 +185,11 @@ async def _synthesize_one(
         text=text,
         speaker_type=speaker_type,
         output_path=output_path,
+        device_index=gpu_index if gpu_index >= 0 else -1,
     )
 
     env = os.environ.copy()
-    if backend == "cuda" and gpu_index >= 0:
+    if gpu_index >= 0:
         env["CUDA_VISIBLE_DEVICES"] = str(gpu_index)
 
     # Ensure binary's directory and all bin subdirs are in PATH and LD_LIBRARY_PATH
@@ -183,6 +198,14 @@ async def _synthesize_one(
         for p in Path("bin").iterdir():
             if p.is_dir():
                 lib_dirs.append(str(p.resolve()))
+
+    system_cuda_libs = [
+        "/usr/local/cuda/lib64",
+        "/usr/local/cuda/targets/x86_64-linux/lib",
+        "/usr/lib/x86_64-linux-gnu",
+        "/usr/lib64",
+    ]
+    lib_dirs.extend([p for p in system_cuda_libs if Path(p).exists()])
 
     ld_str = os.pathsep.join(dict.fromkeys(lib_dirs))
     env["LD_LIBRARY_PATH"] = ld_str + (os.pathsep + env["LD_LIBRARY_PATH"] if "LD_LIBRARY_PATH" in env else "")
