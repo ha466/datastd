@@ -20,12 +20,19 @@ from urllib.request import urlretrieve
 
 AUDIO_BINARIES = {
     "linux": {
-        "url": "https://github.com/0xShug0/audio.cpp/releases/download/v0.9.1/audio-v0.9.1-bin-ubuntu-x64-vulkan.tar.gz",
-        "filename": "audio-v0.9.1-bin-ubuntu-x64-vulkan.tar.gz",
+        "url": "https://github.com/0xShug0/audio.cpp/releases/download/v0.9.1/audio-v0.9.1-bin-ubuntu-x64-cuda12.8-colab.tar.gz",
+        "filename": "audio-v0.9.1-bin-ubuntu-x64-cuda12.8-colab.tar.gz",
     },
     "windows": {
         "url": "https://github.com/0xShug0/audio.cpp/releases/download/v0.9.1/audio-v0.9.1-bin-windows-x64-cuda12.4.zip",
         "filename": "audio-v0.9.1-bin-windows-x64-cuda12.4.zip",
+    },
+}
+
+AUDIO_CUDA_RUNTIME = {
+    "windows": {
+        "url": "https://github.com/0xShug0/audio.cpp/releases/download/v0.9.1/audio-v0.9.1-cudart-windows-x64-cuda12.4.zip",
+        "filename": "audio-v0.9.1-cudart-windows-x64-cuda12.4.zip",
     },
 }
 
@@ -114,10 +121,11 @@ def setup_binaries(platform: str, use_cpu: bool = False):
     bin_dir.mkdir(exist_ok=True)
 
     cli_name = "audiocpp_cli.exe" if platform == "windows" else "audiocpp_cli"
+    server_name = "audiocpp_server.exe" if platform == "windows" else "audiocpp_server"
     llama_name = "llama-server.exe" if platform == "windows" else "llama-server"
 
     # Pre-clean collisions if a directory exists with the same name as binary
-    for name in (cli_name, llama_name):
+    for name in (cli_name, server_name, llama_name):
         target = bin_dir / name
         if target.is_dir() and not target.is_symlink():
             shutil.rmtree(target)
@@ -135,6 +143,18 @@ def setup_binaries(platform: str, use_cpu: bool = False):
     print(f"  Extracting audio.cpp to {bin_dir}/...")
     _extract_archive(audio_archive, bin_dir)
 
+    # Windows CUDA builds need the matching runtime DLL archive beside the binaries.
+    if not use_cpu and platform in AUDIO_CUDA_RUNTIME:
+        runtime_info = AUDIO_CUDA_RUNTIME[platform]
+        runtime_archive = bin_dir / runtime_info["filename"]
+        if not runtime_archive.exists():
+            print(f"\n[1b/4] Downloading audio.cpp CUDA runtime ({platform})...")
+            download(runtime_info["url"], str(runtime_archive))
+        else:
+            print(f"\n[1b/4] audio.cpp CUDA runtime archive already exists: {runtime_archive}")
+        print(f"  Extracting audio.cpp CUDA runtime to {bin_dir}/...")
+        _extract_archive(runtime_archive, bin_dir)
+
     # 2. llama.cpp (llama-server) — CUDA GPU by default for high-speed LLM text generation
     llama_info = LLAMA_CPU_BINARIES[platform] if use_cpu else LLAMA_BINARIES[platform]
     llama_archive = bin_dir / llama_info["filename"]
@@ -151,7 +171,7 @@ def setup_binaries(platform: str, use_cpu: bool = False):
     # Flatten binaries and libraries to bin_dir and set executable permissions
     for root, dirs, files in os.walk(bin_dir):
         for f in files:
-            if f in (cli_name, llama_name) or f.endswith(".dll") or ".so" in f:
+            if f in (cli_name, server_name, llama_name) or f.endswith(".dll") or ".so" in f:
                 src = Path(root) / f
                 dst = bin_dir / f
                 if src.resolve() != dst.resolve():
@@ -181,6 +201,17 @@ def setup_binaries(platform: str, use_cpu: bool = False):
                 shutil.copy2(p, target_cli, follow_symlinks=True)
                 break
 
+    target_server = bin_dir / server_name
+    if not target_server.is_file():
+        for p in bin_dir.rglob(server_name):
+            if p.is_file():
+                if target_server.is_dir() and not target_server.is_symlink():
+                    shutil.rmtree(target_server)
+                elif target_server.is_symlink() or target_server.exists():
+                    target_server.unlink()
+                shutil.copy2(p, target_server, follow_symlinks=True)
+                break
+
     target_llama = bin_dir / llama_name
     if not target_llama.is_file():
         for p in bin_dir.rglob(llama_name):
@@ -193,14 +224,20 @@ def setup_binaries(platform: str, use_cpu: bool = False):
                 break
 
     if platform != "windows":
-        for target in (target_cli, target_llama):
+        for target in (target_cli, target_server, target_llama):
             if target.is_file():
                 try:
                     os.chmod(target, 0o755)
                 except Exception:
                     pass
 
-    print(f"  [OK] audio.cpp CLI ready: {target_cli}")
+    if not target_server.is_file():
+        raise RuntimeError(
+            f"audiocpp_server was not found in the extracted audio.cpp archive: {audio_archive}"
+        )
+
+    print(f"  [OK] audio.cpp CLI ready:    {target_cli}")
+    print(f"  [OK] audio.cpp server ready: {target_server}")
     print(f"  [OK] llama-server ready:  {target_llama}")
 
 

@@ -1,8 +1,8 @@
 """
 GPU detection and worker allocation.
 
-Detects NVIDIA GPUs via nvidia-smi, decides how many parallel TTS workers
-each GPU can handle based on VRAM, and returns an allocation plan.
+Detects NVIDIA GPUs via nvidia-smi and assigns one persistent audio.cpp server
+to each GPU. The server's default model capacity is one active request.
 """
 
 import json
@@ -38,21 +38,8 @@ def detect_gpus() -> list[GPU]:
 
 
 def estimate_workers_per_gpu(vram_mb: int, model_key: str) -> int:
-    """
-    Estimate how many parallel audiocpp_cli processes a GPU can run.
-    Conservative: ~2-4 GB per TTS worker depending on model size.
-    """
-    # ponytail: rough heuristic, good enough for a dataset tool
-    model_vram = {
-        "maya1": 3000,              # ~3 GB
-        "omnivoice": 2500,          # ~2.5 GB (0.6B model)
-        "qwen3_tts_voicedesign": 4000,  # ~4 GB (1.7B model)
-    }
-    per_worker = model_vram.get(model_key, 3000)
-    # Leave ~1 GB headroom for the system
-    available = max(0, vram_mb - 1024)
-    workers = max(1, available // per_worker)
-    return workers
+    """Return the supported per-GPU request capacity for one server/model."""
+    return 1
 
 
 def build_allocation(model_key: str) -> dict:
@@ -77,7 +64,7 @@ def build_allocation(model_key: str) -> dict:
             "name": gpu.name,
             "vram_mb": gpu.vram_mb,
             "workers": w,
-            "backend": "best",
+            "backend": "cuda",
         })
         total += w
 

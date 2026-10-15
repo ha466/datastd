@@ -1,34 +1,45 @@
-"""
-Core pipeline — orchestrates text generation → TTS synthesis across multiple GPUs.
-"""
+"""Dataset pipeline: text generation and persistent audio.cpp TTS servers."""
 
 import asyncio
+import base64
+from collections import deque
+import io
 import json
 import logging
+import math
 import os
 import shutil
+import socket
 import subprocess
-import time
+import tempfile
+import wave
 from pathlib import Path
 
+import httpx
+
 from .gpu import build_allocation
-from .models import MODELS, build_instruct, build_text_gen_prompt, build_cli_args
+from .models import MODELS, build_instruct, build_text_gen_prompt
 from .textgen import generate_batch
 
 log = logging.getLogger(__name__)
 
-# Average seconds of audio per TTS utterance (3-6 sentences ≈ 15-25s)
-AVG_UTTERANCE_SECS = 20
 SECS_PER_HOUR = 3600
+INITIAL_DURATION_GUESS_SECONDS = 20
+MAX_TEXT_BATCH = max(1, int(os.environ.get("TTS_TEXT_BATCH_MAX", "64")))
+MAX_NO_PROGRESS_BATCHES = max(1, int(os.environ.get("TTS_MAX_NO_PROGRESS_BATCHES", "3")))
+TTS_MAX_RETRIES = max(1, int(os.environ.get("TTS_MAX_RETRIES", "3")))
+TTS_REQUEST_TIMEOUT_SECONDS = float(os.environ.get("TTS_REQUEST_TIMEOUT_SECONDS", "600"))
+TTS_SERVER_STARTUP_TIMEOUT_SECONDS = float(os.environ.get("TTS_SERVER_STARTUP_TIMEOUT_SECONDS", "120"))
+TTS_SERVER_THREADS = max(1, int(os.environ.get("TTS_SERVER_THREADS", "2")))
 
 
 def estimate_utterance_count(hours: float) -> int:
-    """How many text utterances we need to fill `hours` of audio."""
-    return max(1, int((hours * SECS_PER_HOUR) / AVG_UTTERANCE_SECS))
+    """Legacy estimate retained for callers; generation now stops on WAV duration."""
+    return max(1, int((hours * SECS_PER_HOUR) / INITIAL_DURATION_GUESS_SECONDS))
 
 
 class Job:
-    """Tracks a dataset generation job."""
+    """Tracks a dataset generation job and its measured audio output."""
 
     def __init__(
         self,
@@ -50,12 +61,14 @@ class Job:
         self.hf_token = hf_token
         self.hf_private = hf_private
         self.hf_url: str | None = None
-        self.status = "pending"
-        self.progress = 0  # 0-100
+        self.status = "queued"
+        self.progress = 0
         self.total_utterances = 0
         self.completed_utterances = 0
-        self.error = None
-        self.allocation = None
+        self.failed_utterances = 0
+        self.audio_seconds = 0.0
+        self.error: str | None = None
+        self.allocation: dict | None = None
 
     def to_dict(self):
         return {
@@ -63,10 +76,15 @@ class Job:
             "model_key": self.model_key,
             "speaker_type": self.speaker_type,
             "hours": self.hours,
+            "target_audio_seconds": max(0.0, float(self.hours) * SECS_PER_HOUR),
+            "audio_seconds": round(self.audio_seconds, 3),
+            "audio_hours": round(self.audio_seconds / SECS_PER_HOUR, 5),
             "status": self.status,
             "progress": self.progress,
             "total_utterances": self.total_utterances,
             "completed_utterances": self.completed_utterances,
+            "failed_utterances": self.failed_utterances,
+            "failure_count": self.failed_utterances,
             "error": self.error,
             "allocation": self.allocation,
             "hf_repo_id": self.hf_repo_id,
@@ -80,10 +98,7 @@ def upload_job_to_huggingface(
     token: str | None = None,
     private: bool = False,
 ) -> str:
-    """
-    Upload the dataset job folder to Hugging Face Hub as a dataset repository.
-    Returns the URL to the dataset repo.
-    """
+    """Upload a dataset folder to the Hub and return its URL."""
     token = token or os.environ.get("HF_TOKEN")
     if not token:
         raise ValueError("Hugging Face write token is required. Pass token or set HF_TOKEN env var.")
@@ -101,8 +116,13 @@ def upload_job_to_huggingface(
     return f"https://huggingface.co/datasets/{repo_id}"
 
 
-# Global job store — ponytail: in-memory is fine for a single-session tool
 _jobs: dict[str, Job] = {}
+_generation_lock = asyncio.Lock()
+
+
+def register_job(job: Job) -> None:
+    """Publish a job before its background coroutine starts, so polling sees queued state."""
+    _jobs[job.job_id] = job
 
 
 def get_job(job_id: str) -> Job | None:
@@ -110,229 +130,566 @@ def get_job(job_id: str) -> Job | None:
 
 
 def list_jobs() -> list[dict]:
-    return [j.to_dict() for j in _jobs.values()]
+    return [job.to_dict() for job in _jobs.values()]
 
 
-def _find_cli() -> str:
-    """Find the audiocpp_cli binary. Checks ./bin/ (including subdirs) then PATH."""
-    candidates = []
+def _find_server() -> str:
+    """Find the pinned audio.cpp server binary in ./bin or PATH."""
+    executable = "audiocpp_server.exe" if os.name == "nt" else "audiocpp_server"
     bin_dir = Path("bin")
     if bin_dir.exists():
-        for name in ("audiocpp_cli", "audiocpp_cli.exe"):
-            p = bin_dir / name
-            if p.exists() and p.is_file():
-                candidates.append(p)
-        for p in bin_dir.rglob("audiocpp_cli*"):
-            if p.is_file() and p.name in ("audiocpp_cli", "audiocpp_cli.exe"):
-                if p not in candidates:
-                    candidates.append(p)
-
-    candidates.extend([
-        Path("audiocpp_cli"),
-        Path("audiocpp_cli.exe"),
-    ])
-    for c in candidates:
-        if c.exists() and c.is_file():
-            if os.name != "nt":
-                try:
-                    os.chmod(c, 0o755)
-                except Exception:
-                    pass
-            return str(c.resolve())
-
-    # Fall back to PATH
-    which_bin = shutil.which("audiocpp_cli")
-    if which_bin and Path(which_bin).is_file():
-        if os.name != "nt":
-            try:
-                os.chmod(which_bin, 0o755)
-            except Exception:
-                pass
-        return which_bin
-    return "audiocpp_cli"
+        candidates = [bin_dir / executable]
+        candidates.extend(p for p in bin_dir.rglob(executable) if p not in candidates)
+        for candidate in candidates:
+            if candidate.is_file():
+                return str(candidate.resolve())
+    found = shutil.which("audiocpp_server")
+    if found:
+        return found
+    raise FileNotFoundError(
+        f"audiocpp_server was not found in ./bin or PATH. Run setup.py to install audio.cpp v0.9.1."
+    )
 
 
 def _find_model(model_key: str) -> str:
-    """Find the downloaded GGUF model file. Checks ./models/ dir."""
     filename = MODELS[model_key]["gguf_filename"]
     path = Path("models") / filename
-    if path.exists():
+    if path.is_file():
         return str(path.resolve())
     raise FileNotFoundError(f"Model file not found: {path}. Download it first via setup.py.")
 
 
-async def _synthesize_one(
-    cli: str, model_path: str, model_key: str, speaker_type: str,
-    text: str, output_path: str, gpu_index: int, backend: str,
-    semaphore: asyncio.Semaphore,
-) -> bool:
-    """Run a single audiocpp_cli TTS call."""
-    cli_path = Path(cli)
-    if cli_path.is_dir():
-        log.error(f"Cannot execute TTS: {cli} is a directory, not an executable file!")
-        return False
-    if os.name != "nt" and cli_path.exists():
-        try:
-            os.chmod(cli_path, 0o755)
-        except Exception:
-            pass
+def _available_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
 
-    cmd = build_cli_args(
-        cli=cli,
-        model_key=model_key,
-        model_path=model_path,
-        backend=backend,
-        text=text,
-        speaker_type=speaker_type,
-        output_path=output_path,
-        device_index=gpu_index if gpu_index >= 0 else -1,
-    )
 
+def _server_environment(server_path: Path, gpu_index: int) -> dict[str, str]:
     env = os.environ.copy()
-    if gpu_index >= 0:
-        env["CUDA_VISIBLE_DEVICES"] = str(gpu_index)
-
-    # Ensure binary's directory and all bin subdirs are in PATH and LD_LIBRARY_PATH
-    lib_dirs = [str(cli_path.parent.resolve()), str(Path("bin").resolve())]
-    if Path("bin").exists():
-        for p in Path("bin").iterdir():
-            if p.is_dir():
-                lib_dirs.append(str(p.resolve()))
-
-    system_cuda_libs = [
+    bin_dir = Path("bin").resolve()
+    lib_dirs = [str(server_path.parent.resolve()), str(bin_dir)]
+    if bin_dir.exists():
+        lib_dirs.extend(str(path.resolve()) for path in bin_dir.iterdir() if path.is_dir())
+    cuda_dirs = (
         "/usr/local/cuda/lib64",
         "/usr/local/cuda/targets/x86_64-linux/lib",
         "/usr/lib/x86_64-linux-gnu",
         "/usr/lib64",
-    ]
-    lib_dirs.extend([p for p in system_cuda_libs if Path(p).exists()])
+    )
+    lib_dirs.extend(path for path in cuda_dirs if Path(path).exists())
+    runtime_path = os.pathsep.join(dict.fromkeys(lib_dirs))
+    env["PATH"] = runtime_path + os.pathsep + env.get("PATH", "")
+    if os.name != "nt":
+        env["LD_LIBRARY_PATH"] = runtime_path + (
+            os.pathsep + env["LD_LIBRARY_PATH"] if env.get("LD_LIBRARY_PATH") else ""
+        )
+    env["OMP_NUM_THREADS"] = str(TTS_SERVER_THREADS)
+    if gpu_index >= 0:
+        env["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+        env["CUDA_VISIBLE_DEVICES"] = str(gpu_index)
+    else:
+        env["CUDA_VISIBLE_DEVICES"] = ""
+    return env
 
-    ld_str = os.pathsep.join(dict.fromkeys(lib_dirs))
-    env["LD_LIBRARY_PATH"] = ld_str + (os.pathsep + env["LD_LIBRARY_PATH"] if "LD_LIBRARY_PATH" in env else "")
-    env["PATH"] = ld_str + os.pathsep + env.get("PATH", "")
 
-    async with semaphore:
+class TtsServer:
+    def __init__(self, gpu: dict, port: int, process, log_path: Path, log_handle):
+        self.gpu = gpu
+        self.gpu_index = int(gpu["index"])
+        self.port = port
+        self.base_url = f"http://127.0.0.1:{port}"
+        self.process = process
+        self.log_path = log_path
+        self.log_handle = log_handle
+
+
+class TtsFleet:
+    """One reusable audio.cpp server per physical GPU (one active request each)."""
+
+    def __init__(self, job: Job, allocation: dict, model_path: str):
+        self.job = job
+        self.allocation = allocation
+        self.model_path = model_path
+        self.servers: list[TtsServer] = []
+        self.runtime_dir: Path | None = None
+
+    async def start(self) -> list[TtsServer]:
+        server_bin = Path(_find_server())
+        self.runtime_dir = Path(tempfile.mkdtemp(prefix=f"datastd-{self.job.job_id}-"))
         try:
-            proc = await asyncio.create_subprocess_exec(
-                *cmd, env=env,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            stdout, stderr = await proc.communicate()
-            if proc.returncode != 0:
-                log.warning(f"TTS failed for {output_path}: {stderr.decode()[:500]}")
-                return False
-            return True
-        except Exception as e:
-            log.warning(f"TTS error for {output_path}: {e}")
-            return False
+            for gpu in self.allocation["gpus"]:
+                gpu_index = int(gpu["index"])
+                backend = "cpu" if gpu_index < 0 else "cuda"
+                port = _available_port()
+                config_path = self.runtime_dir / f"server_gpu{gpu_index}.json"
+                log_path = self.runtime_dir / f"server_gpu{gpu_index}.log"
+                config = {
+                    "host": "127.0.0.1",
+                    "port": port,
+                    "backend": backend,
+                    # CUDA_VISIBLE_DEVICES renumbers the assigned physical GPU to ordinal zero.
+                    "device": 0,
+                    "threads": TTS_SERVER_THREADS,
+                    "lazy_load": True,
+                    "log_request_body": False,
+                    "models": [{
+                        "id": self.job.model_key,
+                        "family": MODELS[self.job.model_key]["family"],
+                        "path": self.model_path,
+                        "task": MODELS[self.job.model_key].get("task", "tts"),
+                        "mode": "offline",
+                    }],
+                }
+                config_path.write_text(json.dumps(config, indent=2), encoding="utf-8")
+                log_handle = log_path.open("w", encoding="utf-8")
+                creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) if os.name == "nt" else 0
+                try:
+                    process = await asyncio.create_subprocess_exec(
+                        str(server_bin), "--config", str(config_path),
+                        stdin=asyncio.subprocess.DEVNULL,
+                        stdout=log_handle,
+                        stderr=asyncio.subprocess.STDOUT,
+                        env=_server_environment(server_bin, gpu_index),
+                        creationflags=creationflags,
+                    )
+                except Exception:
+                    log_handle.close()
+                    raise
+                server = TtsServer(gpu, port, process, log_path, log_handle)
+                self.servers.append(server)
+                log.info(
+                    "Started audiocpp_server for GPU %s (%s) on %s",
+                    gpu_index,
+                    gpu.get("name", "GPU"),
+                    server.base_url,
+                )
+
+            readiness = [asyncio.create_task(self._wait_until_ready(server)) for server in self.servers]
+            try:
+                await asyncio.gather(*readiness)
+            except Exception:
+                for task in readiness:
+                    task.cancel()
+                await asyncio.gather(*readiness, return_exceptions=True)
+                raise
+            return self.servers
+        except Exception:
+            await self.close()
+            raise
+
+    async def _wait_until_ready(self, server: TtsServer) -> None:
+        deadline = asyncio.get_running_loop().time() + TTS_SERVER_STARTUP_TIMEOUT_SECONDS
+        async with httpx.AsyncClient(timeout=2) as client:
+            while asyncio.get_running_loop().time() < deadline:
+                if server.process.returncode is not None:
+                    detail = _tail_file(server.log_path)
+                    raise RuntimeError(
+                        f"audiocpp_server exited during startup on GPU {server.gpu_index} "
+                        f"(code {server.process.returncode}). Last log lines:\n{detail}"
+                    )
+                try:
+                    response = await client.get(f"{server.base_url}/health")
+                    if response.status_code == 200:
+                        log.info("audiocpp_server ready on GPU %s", server.gpu_index)
+                        return
+                except httpx.HTTPError:
+                    pass
+                await asyncio.sleep(0.5)
+        detail = _tail_file(server.log_path)
+        raise RuntimeError(
+            f"Timed out waiting for audiocpp_server on GPU {server.gpu_index}. Last log lines:\n{detail}"
+        )
+
+    async def close(self) -> None:
+        for server in reversed(self.servers):
+            process = server.process
+            if process.returncode is None:
+                try:
+                    process.terminate()
+                    await asyncio.wait_for(process.wait(), timeout=10)
+                except (asyncio.TimeoutError, ProcessLookupError):
+                    try:
+                        process.kill()
+                        await asyncio.wait_for(process.wait(), timeout=5)
+                    except (asyncio.TimeoutError, ProcessLookupError):
+                        log.warning("Could not fully stop audiocpp_server pid %s", process.pid)
+                except Exception:
+                    log.exception("Error stopping audiocpp_server pid %s", process.pid)
+            try:
+                server.log_handle.close()
+            except Exception:
+                pass
+        self.servers.clear()
+        if self.runtime_dir is not None:
+            shutil.rmtree(self.runtime_dir, ignore_errors=True)
+            self.runtime_dir = None
+
+
+def _tail_file(path: Path, lines: int = 30) -> str:
+    try:
+        return "\n".join(path.read_text(encoding="utf-8", errors="replace").splitlines()[-lines:])[-5000:]
+    except Exception:
+        return ""
+
+
+def _decode_audio_value(value) -> bytes | None:
+    if isinstance(value, dict):
+        value = value.get("payload") or value.get("data")
+    if not isinstance(value, str):
+        return None
+    if value.startswith("data:") and "," in value:
+        value = value.split(",", 1)[1]
+    try:
+        decoded = base64.b64decode(value, validate=True)
+    except Exception:
+        return None
+    if decoded.startswith(b"RIFF") and b"WAVE" in decoded[:16]:
+        return decoded
+    return None
+
+
+def _audio_from_task_result(payload) -> bytes:
+    if isinstance(payload, dict):
+        result = payload.get("result", payload)
+        if isinstance(result, dict):
+            for key in ("audio", "audio_base64"):
+                decoded = _decode_audio_value(result.get(key))
+                if decoded:
+                    return decoded
+            for artifact in result.get("artifacts", []):
+                if isinstance(artifact, dict):
+                    decoded = _decode_audio_value(artifact.get("payload") or artifact.get("data"))
+                    if decoded:
+                        return decoded
+    raise ValueError("server response did not contain base64 WAV audio")
+
+
+def _validate_wav(audio_bytes: bytes) -> float:
+    if not audio_bytes.startswith(b"RIFF") or b"WAVE" not in audio_bytes[:16]:
+        raise ValueError("server output is not a RIFF/WAVE file")
+    with wave.open(io.BytesIO(audio_bytes), "rb") as wav_file:
+        channels = wav_file.getnchannels()
+        sample_width = wav_file.getsampwidth()
+        sample_rate = wav_file.getframerate()
+        frame_count = wav_file.getnframes()
+        if wav_file.getcomptype() != "NONE":
+            raise ValueError(f"unsupported WAV compression: {wav_file.getcomptype()}")
+        if channels < 1 or sample_width not in (1, 2, 3, 4) or sample_rate < 1 or frame_count < 1:
+            raise ValueError("WAV has invalid channel, sample-width, sample-rate, or frame-count metadata")
+        frame_data = wav_file.readframes(frame_count)
+        expected_bytes = frame_count * channels * sample_width
+        if len(frame_data) != expected_bytes:
+            raise ValueError("WAV frame data is truncated or incomplete")
+        duration = frame_count / sample_rate
+        if not math.isfinite(duration) or duration <= 0:
+            raise ValueError("WAV duration is invalid")
+        return duration
+
+
+async def _synthesize_request(
+    client: httpx.AsyncClient,
+    server: TtsServer,
+    model_key: str,
+    speaker_type: str,
+    text: str,
+    output_path: Path,
+) -> tuple[float | None, str | None]:
+    request = {"text": text, "instruct": build_instruct(model_key, speaker_type)}
+    payload = {"model": model_key, "request": request}
+    last_error = "unknown TTS failure"
+    for attempt in range(1, TTS_MAX_RETRIES + 1):
+        temp_path = output_path.with_name(output_path.name + ".tmp")
+        try:
+            response = await client.post(f"{server.base_url}/v1/tasks/run", json=payload)
+            response.raise_for_status()
+            try:
+                result = response.json()
+            except ValueError:
+                result = None
+            if response.content.startswith(b"RIFF"):
+                audio_bytes = response.content
+            else:
+                audio_bytes = _audio_from_task_result(result)
+            duration = _validate_wav(audio_bytes)
+            temp_path.write_bytes(audio_bytes)
+            os.replace(temp_path, output_path)
+            return duration, None
+        except Exception as exc:
+            try:
+                temp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            if isinstance(exc, httpx.HTTPStatusError):
+                detail = exc.response.text[:1000]
+                last_error = f"HTTP {exc.response.status_code}: {detail}"
+            else:
+                last_error = f"{type(exc).__name__}: {exc}"
+            if attempt < TTS_MAX_RETRIES:
+                await asyncio.sleep(min(2 * attempt, 5))
+    return None, last_error
+
+
+def _atomic_write(path: Path, content: str) -> None:
+    temp_path = path.with_name(path.name + ".tmp")
+    temp_path.write_text(content, encoding="utf-8")
+    os.replace(temp_path, path)
+
+
+def _save_job_files(job: Job, entries: list[dict]) -> None:
+    entries = sorted(entries, key=lambda entry: entry["id"])
+    _atomic_write(job.output_dir / "manifest.json", json.dumps(entries, indent=2, ensure_ascii=False))
+    _atomic_write(job.output_dir / "texts.txt", "\n---\n".join(entry["text"] for entry in entries))
+
+
+async def _queue_worker(
+    job: Job,
+    server: TtsServer,
+    model_key: str,
+    speaker_type: str,
+    queue: asyncio.Queue,
+    client: httpx.AsyncClient,
+    successful_entries: list[dict],
+    last_failures: deque[str],
+    target_seconds: float,
+) -> None:
+    while True:
+        item = await queue.get()
+        try:
+            if item is None:
+                return
+            utterance_id, text = item
+            if job.audio_seconds >= target_seconds:
+                continue
+            output_path = job.output_dir / f"utt_{utterance_id:06d}.wav"
+            try:
+                duration, error = await _synthesize_request(
+                    client, server, model_key, speaker_type, text, output_path
+                )
+            except Exception as exc:
+                duration, error = None, f"{type(exc).__name__}: {exc}"
+            if duration is None:
+                job.failed_utterances += 1
+                last_failures.append(f"GPU {server.gpu_index}, utterance {utterance_id}: {error}")
+                log.warning("Job %s TTS failed for utterance %s: %s", job.job_id, utterance_id, error)
+            else:
+                successful_entries.append({
+                    "id": utterance_id,
+                    "text": text,
+                    "audio": output_path.name,
+                    "duration_seconds": round(duration, 6),
+                })
+                job.completed_utterances += 1
+                job.audio_seconds += duration
+                job.progress = min(95, 20 + int(75 * min(1.0, job.audio_seconds / target_seconds)))
+        finally:
+            queue.task_done()
+
+
+async def _generate_job(job: Job) -> None:
+    if job.hours <= 0:
+        raise ValueError("Requested audio duration must be greater than zero hours.")
+
+    target_seconds = float(job.hours) * SECS_PER_HOUR
+    job.allocation = build_allocation(job.model_key)
+    job.output_dir.mkdir(parents=True, exist_ok=True)
+    worker_count = max(1, int(job.allocation["total_workers"]))
+    model_path = _find_model(job.model_key)
+    fleet = TtsFleet(job, job.allocation, model_path)
+    successful_entries: list[dict] = []
+    last_failures: deque[str] = deque(maxlen=5)
+    attempts = 0
+    no_progress_batches = 0
+    average_duration = float(INITIAL_DURATION_GUESS_SECONDS)
+    job.status = "starting_tts"
+    log.info(
+        "Job %s: starting %d persistent TTS server(s) for %.3f target audio hours",
+        job.job_id,
+        worker_count,
+        job.hours,
+    )
+
+    try:
+        _save_job_files(job, successful_entries)
+        servers = await fleet.start()
+        queue: asyncio.Queue = asyncio.Queue(maxsize=max(1, len(servers) * 2))
+        timeout = httpx.Timeout(
+            connect=10,
+            read=TTS_REQUEST_TIMEOUT_SECONDS,
+            write=30,
+            pool=10,
+        )
+        limits = httpx.Limits(max_connections=max(1, len(servers)), max_keepalive_connections=max(1, len(servers)))
+        async with httpx.AsyncClient(timeout=timeout, limits=limits) as client:
+            workers = [
+                asyncio.create_task(_queue_worker(
+                    job,
+                    server,
+                    job.model_key,
+                    job.speaker_type,
+                    queue,
+                    client,
+                    successful_entries,
+                    last_failures,
+                    target_seconds,
+                ))
+                for server in servers
+            ]
+            try:
+                while job.audio_seconds < target_seconds:
+                    before_seconds = job.audio_seconds
+                    remaining_seconds = target_seconds - before_seconds
+                    batch_count = max(1, min(MAX_TEXT_BATCH, math.ceil(remaining_seconds / max(1.0, average_duration))))
+                    job.status = "generating_text"
+                    prompt = build_text_gen_prompt(job.model_key, job.speaker_type)
+
+                    def on_text_progress(current, total):
+                        job.progress = max(job.progress, min(19, 10 + int(9 * current / max(1, total))))
+
+                    async def enqueue_text(text):
+                        nonlocal attempts
+                        if job.audio_seconds >= target_seconds:
+                            return False
+                        utterance_id = attempts
+                        attempts += 1
+                        job.total_utterances = attempts
+                        job.status = "synthesizing"
+                        await queue.put((utterance_id, text))
+                        return True
+
+                    texts = await generate_batch(
+                        prompt,
+                        batch_count,
+                        on_progress=on_text_progress,
+                        on_text=enqueue_text,
+                    )
+                    if not texts:
+                        no_progress_batches += 1
+                        log.warning("Job %s received no text in batch %s", job.job_id, no_progress_batches)
+                        if no_progress_batches >= MAX_NO_PROGRESS_BATCHES:
+                            job.error = "Text generation returned no usable samples after repeated attempts. Check the LLM server and its logs."
+                            break
+                        continue
+
+                    await queue.join()
+                    _save_job_files(job, successful_entries)
+
+                    if job.audio_seconds > before_seconds:
+                        no_progress_batches = 0
+                        average_duration = job.audio_seconds / max(1, job.completed_utterances)
+                    else:
+                        no_progress_batches += 1
+                    log.info(
+                        "Job %s: %.1f/%.1f valid audio seconds, %d complete, %d failed",
+                        job.job_id,
+                        job.audio_seconds,
+                        target_seconds,
+                        job.completed_utterances,
+                        job.failed_utterances,
+                    )
+                    if no_progress_batches >= MAX_NO_PROGRESS_BATCHES:
+                        job.error = (
+                            f"Audio generation made no valid progress in {no_progress_batches} batches. "
+                            "Check the TTS server logs and available GPU memory."
+                        )
+                        break
+            finally:
+                for _ in workers:
+                    await queue.put(None)
+                await queue.join()
+                await asyncio.gather(*workers, return_exceptions=True)
+    finally:
+        await fleet.close()
+        try:
+            _save_job_files(job, successful_entries)
+        except Exception:
+            log.exception("Could not save successful manifest for job %s", job.job_id)
+    reached_target = job.audio_seconds >= target_seconds
+    if job.completed_utterances == 0:
+        job.status = "error"
+        if not job.error:
+            job.error = "No valid WAV audio was generated. Check the TTS server logs and model configuration."
+    elif not reached_target or job.failed_utterances:
+        job.status = "partial"
+        if not job.error:
+            if not reached_target:
+                job.error = (
+                    f"Stopped at {job.audio_seconds:.1f}/{target_seconds:.1f} valid audio seconds "
+                    f"after {job.failed_utterances} utterance failure(s)."
+                )
+            else:
+                job.error = f"Target duration reached, but {job.failed_utterances} utterance(s) failed after retries."
+    else:
+        job.status = "done"
+        job.error = None
+    if last_failures and job.failed_utterances:
+        job.error = f"{job.error} Last synthesis failure: {last_failures[-1]}"
+    job.progress = 100
+    _write_job_metadata(job)
+
+
+def _write_job_metadata(job: Job) -> None:
+    target_seconds = max(0.0, float(job.hours) * SECS_PER_HOUR)
+    metadata = {
+        "model": job.model_key,
+        "speaker_type": job.speaker_type,
+        "target_hours": job.hours,
+        "target_audio_seconds": target_seconds,
+        "audio_seconds": round(job.audio_seconds, 6),
+        "audio_hours": round(job.audio_seconds / SECS_PER_HOUR, 6),
+        "total_utterances": job.total_utterances,
+        "completed_utterances": job.completed_utterances,
+        "failed_utterances": job.failed_utterances,
+        "status": job.status,
+        "error": job.error,
+        "allocation": job.allocation,
+    }
+    job.output_dir.mkdir(parents=True, exist_ok=True)
+    _atomic_write(job.output_dir / "metadata.json", json.dumps(metadata, indent=2, ensure_ascii=False))
 
 
 async def run_job(job: Job):
-    """Execute a dataset generation job."""
-    _jobs[job.job_id] = job
-    job.status = "running"
-
+    """Serialize GPU jobs, while leaving the event loop free during long work and uploads."""
+    register_job(job)
+    log.info("Job %s queued for GPU resources", job.job_id)
     try:
-        # 1. Figure out how many utterances we need
-        job.total_utterances = estimate_utterance_count(job.hours)
-        log.info(f"Job {job.job_id}: generating {job.total_utterances} utterances for {job.hours}h")
+        async with _generation_lock:
+            await _generate_job(job)
 
-        # 2. Build GPU allocation
-        job.allocation = build_allocation(job.model_key)
-        total_workers = job.allocation["total_workers"]
-        log.info(f"Job {job.job_id}: {total_workers} parallel workers across {len(job.allocation['gpus'])} device(s)")
-
-        # 3. Generate text data
-        job.status = "generating_text"
-        prompt = build_text_gen_prompt(job.model_key, job.speaker_type)
-
-        def on_text_progress(cur, total):
-            job.progress = int((cur / total) * 20)
-
-        texts = await generate_batch(prompt, job.total_utterances, on_progress=on_text_progress)
-        if not texts:
-            job.status = "error"
-            job.error = "Failed to generate text data. Ensure Ollama/LLM is running at LLM_BASE_URL."
-            return
-
-        job.total_utterances = len(texts)  # adjust to actual count
-
-        # 4. Save text manifest
-        job.output_dir.mkdir(parents=True, exist_ok=True)
-        manifest = []
-        for i, text in enumerate(texts):
-            wav_name = f"utt_{i:06d}.wav"
-            manifest.append({"id": i, "text": text, "audio": wav_name})
-
-        manifest_path = job.output_dir / "manifest.json"
-        manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False))
-
-        # Also save a simple text-only file for reference
-        texts_path = job.output_dir / "texts.txt"
-        texts_path.write_text("\n---\n".join(texts))
-
-        # 5. Synthesize audio with parallel workers
-        job.status = "synthesizing"
-        cli = _find_cli()
-        model_path = _find_model(job.model_key)
-
-        # Build per-GPU semaphores and task assignment
-        gpu_configs = job.allocation["gpus"]
-        gpu_semaphores = {}
-        for gc in gpu_configs:
-            gpu_semaphores[gc["index"]] = asyncio.Semaphore(gc["workers"])
-
-        tasks = []
-        for i, entry in enumerate(manifest):
-            gc = gpu_configs[i % len(gpu_configs)]
-            out_path = str(job.output_dir / entry["audio"])
-            sem = gpu_semaphores[gc["index"]]
-
-            tasks.append(_synthesize_one(
-                cli, model_path, job.model_key, job.speaker_type,
-                entry["text"], out_path, gc["index"], gc["backend"], sem,
-            ))
-
-        # Run all tasks, updating progress (20% to 100%)
-        for i, coro in enumerate(asyncio.as_completed(tasks)):
-            result = await coro
-            if result:
-                job.completed_utterances += 1
-            job.progress = 20 + int(((i + 1) / len(tasks)) * 80)
-
-        # 6. Save metadata
-        meta = {
-            "model": job.model_key,
-            "speaker_type": job.speaker_type,
-            "target_hours": job.hours,
-            "total_utterances": job.total_utterances,
-            "completed": job.completed_utterances,
-            "allocation": job.allocation,
-        }
-        (job.output_dir / "metadata.json").write_text(json.dumps(meta, indent=2))
-
-        # 7. Upload to Hugging Face if requested
-        if job.hf_repo_id:
+        if job.hf_repo_id and job.status in ("done", "partial"):
+            generation_status = job.status
+            job.status = "uploading_hf"
             try:
-                job.status = "uploading_hf"
-                log.info(f"Job {job.job_id}: uploading dataset to Hugging Face ({job.hf_repo_id})...")
-                job.hf_url = upload_job_to_huggingface(
+                log.info("Job %s: uploading to Hugging Face (%s)", job.job_id, job.hf_repo_id)
+                job.hf_url = await asyncio.to_thread(
+                    upload_job_to_huggingface,
                     job.output_dir,
                     job.hf_repo_id,
                     job.hf_token,
                     job.hf_private,
                 )
-                log.info(f"Job {job.job_id}: uploaded to Hugging Face at {job.hf_url}")
-            except Exception as e:
-                log.warning(f"Job {job.job_id}: Hugging Face upload failed: {e}")
-                job.error = f"Audio generated successfully, but HF upload failed: {e}"
-
-        job.status = "done"
+                job.status = generation_status
+            except Exception as exc:
+                job.status = "partial"
+                upload_error = f"Audio generation finished, but Hugging Face upload failed: {exc}"
+                job.error = f"{job.error}; {upload_error}" if job.error else upload_error
+                log.warning("Job %s upload failed: %s", job.job_id, exc)
+            _write_job_metadata(job)
+        log.info(
+            "Job %s finished as %s: %.1f valid seconds, %d/%d complete, %d failed",
+            job.job_id,
+            job.status,
+            job.audio_seconds,
+            job.completed_utterances,
+            job.total_utterances,
+            job.failed_utterances,
+        )
+    except Exception as exc:
+        job.status = "error" if job.completed_utterances == 0 else "partial"
+        job.error = str(exc)
         job.progress = 100
-        log.info(f"Job {job.job_id}: done. {job.completed_utterances}/{job.total_utterances} succeeded.")
-
-    except Exception as e:
-        job.status = "error"
-        job.error = str(e)
-        log.exception(f"Job {job.job_id} failed")
+        log.exception("Job %s failed", job.job_id)
+        try:
+            _write_job_metadata(job)
+        except Exception:
+            log.exception("Could not write failure metadata for job %s", job.job_id)

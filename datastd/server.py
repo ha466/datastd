@@ -16,7 +16,7 @@ from pydantic import BaseModel
 
 from .gpu import build_allocation, detect_gpus
 from .models import MODELS
-from .pipeline import Job, get_job, list_jobs, run_job, upload_job_to_huggingface
+from .pipeline import Job, get_job, list_jobs, register_job, run_job, upload_job_to_huggingface
 from .textgen import is_llm_server_running, start_llama_server, stop_llama_server, LLM_MODEL
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -115,8 +115,9 @@ async def api_start_job(req: StartJobRequest, bg: BackgroundTasks):
         hf_token=req.hf_token,
         hf_private=req.hf_private,
     )
+    register_job(job)
     bg.add_task(run_job, job)
-    return {"job_id": job_id, "status": "started"}
+    return {"job_id": job_id, "status": "queued"}
 
 
 @app.get("/api/jobs")
@@ -142,18 +143,25 @@ async def api_upload_hf(job_id: str, req: UploadHfRequest):
         raise HTTPException(status_code=404, detail="Job not found")
     if not job.output_dir.exists():
         raise HTTPException(status_code=400, detail="Job output directory does not exist")
+    if job.status not in ("done", "partial"):
+        raise HTTPException(status_code=409, detail="Only completed or partial jobs can be uploaded")
 
+    previous_status = job.status
+    job.status = "uploading_hf"
     try:
-        url = upload_job_to_huggingface(
-            job_dir=job.output_dir,
-            repo_id=req.repo_id,
-            token=req.token,
-            private=req.private,
+        url = await asyncio.to_thread(
+            upload_job_to_huggingface,
+            job.output_dir,
+            req.repo_id,
+            req.token,
+            req.private,
         )
         job.hf_url = url
         job.hf_repo_id = req.repo_id
+        job.status = previous_status
         return {"status": "ok", "url": url, "repo_id": req.repo_id}
     except Exception as e:
+        job.status = previous_status
         raise HTTPException(status_code=500, detail=str(e))
 
 

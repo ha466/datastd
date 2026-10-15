@@ -93,7 +93,15 @@ curl -X POST http://localhost:7860/api/jobs/start \
 | `PORT` | `7860` | Server port |
 | `LLM_PORT` | `8080` | Native llama-server port |
 | `LLM_MODEL` | `qwen2.5-1.5b-instruct-q4_k_m.gguf` | Local GGUF LLM filename in `models/` |
+| `LLM_PARALLEL` | `2` | Concurrent llama-server slots and text requests |
+| `LLM_CONTEXT_SIZE` | `4096` | Total llama-server context size shared across slots |
 | `LLM_BASE_URL` | `http://127.0.0.1:8080/v1` | OpenAI-compatible endpoint (local or remote) |
+| `TTS_TEXT_BATCH_MAX` | `64` | Maximum generated-text batch before valid-audio duration is measured again |
+| `TTS_MAX_RETRIES` | `3` | Synthesis attempts per utterance before it is counted as failed |
+| `TTS_MAX_NO_PROGRESS_BATCHES` | `3` | Consecutive batches without valid audio before generation stops |
+| `TTS_REQUEST_TIMEOUT_SECONDS` | `600` | Per-utterance audio.cpp request timeout |
+| `TTS_SERVER_STARTUP_TIMEOUT_SECONDS` | `120` | Maximum wait for each audio.cpp server to become ready |
+| `TTS_SERVER_THREADS` | `2` | CPU threads assigned to each audio.cpp server |
 | `HF_TOKEN` | *(empty)* | Hugging Face write token for dataset uploads |
 | `NGROK_AUTHTOKEN` | *(empty)* | Optional Ngrok auth token for public gateway |
 
@@ -103,10 +111,10 @@ curl -X POST http://localhost:7860/api/jobs/start \
 
 ```
 output/<job_id>/
-├── manifest.json       # Array of {"id": 0, "text": "...", "audio": "utt_000000.wav"}
+├── manifest.json       # Successful WAVs only, with measured duration_seconds
 ├── texts.txt           # Generated lines with inline emotion tags
 ├── metadata.json       # Job config, GPU allocation, stats
-└── utt_000000.wav      # Synthesized 24 kHz audio files
+└── utt_000000.wav      # Validated synthesized WAV audio files
 ```
 
 ---
