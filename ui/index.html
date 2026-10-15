@@ -1,0 +1,336 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>DataSTD — Synthetic Voice Dataset Generator</title>
+    <link rel="stylesheet" href="/ui/style.css">
+</head>
+<body>
+    <div class="app">
+        <header>
+            <h1>🎙️ DataSTD</h1>
+            <p class="subtitle">Synthetic Voice Dataset Generator · Native audio.cpp & llama.cpp</p>
+            <div class="header-badges">
+                <div id="tunnel-banner" style="display:none;" class="chip chip-blue">
+                    🌐 Gateway: <a id="tunnel-link" href="#" target="_blank" style="color:#58a6ff; margin-left:4px; font-weight:bold;"></a>
+                </div>
+                <div id="llm-badge" class="chip chip-purple">
+                    🤖 LLM: Native llama-server (Qwen2.5-1.5B-Instruct)
+                </div>
+            </div>
+        </header>
+
+        <main>
+            <!-- GPU Info Bar -->
+            <section class="card gpu-bar" id="gpu-bar">
+                <h3>⚡ GPU Acceleration & Workers</h3>
+                <div id="gpu-info">Detecting GPUs...</div>
+            </section>
+
+            <!-- Config Form -->
+            <section class="card">
+                <h2>Configure Dataset</h2>
+
+                <div class="form-group">
+                    <label for="model-select">TTS Model Family</label>
+                    <select id="model-select">
+                        <option value="">Loading models...</option>
+                    </select>
+                    <div id="model-info" class="model-info"></div>
+                </div>
+
+                <div class="form-group">
+                    <label for="speaker-type">Speaker Type / Persona Description</label>
+                    <input type="text" id="speaker-type"
+                           placeholder="e.g. young female narrator, warm male podcaster, elderly British gentleman"
+                           value="young female narrator">
+                    <small>Fills the model instruct template automatically and conditions both the voice delivery and text content.</small>
+                </div>
+
+                <div class="form-group">
+                    <label for="hours">Target Hours of Audio</label>
+                    <input type="number" id="hours" min="0.1" max="100" step="0.1" value="1">
+                    <small id="utterance-estimate"></small>
+                </div>
+
+                <div class="form-group">
+                    <label for="output-dir">Output Directory</label>
+                    <input type="text" id="output-dir" value="output">
+                </div>
+
+                <!-- Allocation Preview -->
+                <div id="allocation-preview" class="allocation-preview"></div>
+
+                <button id="btn-preview" class="btn btn-secondary" onclick="previewAllocation()">
+                    Preview Worker Allocation
+                </button>
+                <button id="btn-start" class="btn btn-primary" onclick="startJob()">
+                    🚀 Start Dataset Generation
+                </button>
+            </section>
+
+            <!-- Active Jobs -->
+            <section class="card" id="jobs-section" style="display:none">
+                <h2>Active Generation Jobs</h2>
+                <div id="jobs-list"></div>
+            </section>
+
+            <!-- Template Preview -->
+            <section class="card">
+                <h2>Template & Instruction Preview</h2>
+                <p class="small">Live preview of the --instruct CLI flag and the small LLM text generation prompt.</p>
+                <div id="template-preview" class="code-block"></div>
+            </section>
+
+            <!-- REST API Reference -->
+            <section class="card">
+                <h2>Remote API & Gateway Reference</h2>
+                <p class="small">Control DataSTD programmatically via curl or Python over the Gateway URL:</p>
+                <details>
+                    <summary>View API Endpoints</summary>
+                    <div class="code-block" style="margin-top:10px;">
+<strong>GET  /api/models</strong>       - List models, descriptions, and tags
+<strong>GET  /api/gpus</strong>         - Detected GPUs and VRAM in MB
+<strong>POST /api/allocation</strong>   - Preview worker allocation plan
+<strong>POST /api/jobs/start</strong>   - Submit job: {"model_key": "maya1", "speaker_type": "...", "hours": 1.0}
+<strong>GET  /api/jobs/{job_id}</strong> - Track job status, progress %, and completed utterances
+<strong>GET  /api/jobs</strong>          - List all jobs
+<strong>GET  /api/info</strong>          - Server status, gateway URL, and LLM state
+                    </div>
+                </details>
+            </section>
+        </main>
+
+        <footer>
+            <p>DataSTD · Powered by <a href="https://github.com/0xShug0/audio.cpp" target="_blank">audio.cpp</a> and <a href="https://github.com/ggml-org/llama.cpp" target="_blank">llama.cpp</a></p>
+        </footer>
+    </div>
+
+    <script>
+        // State
+        let models = {};
+        let pollInterval = null;
+
+        // --- Init ---
+        async function init() {
+            await Promise.all([loadModels(), loadGPUs(), loadInfo()]);
+            updateEstimate();
+            updateTemplatePreview();
+        }
+
+        async function loadInfo() {
+            try {
+                const resp = await fetch('/api/info');
+                const data = await resp.json();
+                if (data.tunnel_url) {
+                    const banner = document.getElementById('tunnel-banner');
+                    const link = document.getElementById('tunnel-link');
+                    link.href = data.tunnel_url;
+                    link.textContent = data.tunnel_url;
+                    banner.style.display = 'inline-flex';
+                }
+                const llmBadge = document.getElementById('llm-badge');
+                if (data.llm_model) {
+                    llmBadge.textContent = `🤖 LLM: Native llama-server (${data.llm_model})`;
+                }
+            } catch (e) {
+                // Ignore if tunnel info not available
+            }
+        }
+
+        async function loadModels() {
+            try {
+                const resp = await fetch('/api/models');
+                models = await resp.json();
+                const sel = document.getElementById('model-select');
+                sel.innerHTML = '';
+                for (const [key, m] of Object.entries(models)) {
+                    const opt = document.createElement('option');
+                    opt.value = key;
+                    opt.textContent = m.display_name;
+                    sel.appendChild(opt);
+                }
+                sel.addEventListener('change', () => {
+                    updateModelInfo();
+                    updateTemplatePreview();
+                });
+                updateModelInfo();
+            } catch (e) {
+                console.error('Failed to load models:', e);
+            }
+        }
+
+        async function loadGPUs() {
+            try {
+                const resp = await fetch('/api/gpus');
+                const data = await resp.json();
+                const el = document.getElementById('gpu-info');
+                if (data.count === 0) {
+                    el.innerHTML = '<span class="warn">No NVIDIA GPUs detected. Running on CPU workers.</span>';
+                } else {
+                    el.innerHTML = data.gpus.map(g =>
+                        `<span class="chip chip-blue">GPU ${g.index}: ${g.name} (${(g.vram_mb/1024).toFixed(1)} GB VRAM)</span>`
+                    ).join(' ');
+                }
+            } catch (e) {
+                document.getElementById('gpu-info').innerHTML = '<span class="warn">GPU detection query failed</span>';
+            }
+        }
+
+        function updateModelInfo() {
+            const key = document.getElementById('model-select').value;
+            const m = models[key];
+            if (!m) return;
+
+            let html = '';
+            if (m.description) {
+                html += `<div class="model-desc">${m.description}</div>`;
+            }
+            html += `<div><strong>Languages:</strong> ${m.languages.join(', ')}</div>`;
+
+            if (m.inline_tags && m.inline_tags.length > 0) {
+                html += `<div class="tags-container">
+                    <div class="tags-title">Supported Inline Expression & Performance Tags (${m.inline_tags.length}):</div>
+                    <div class="tag-cloud">
+                        ${m.inline_tags.map(t => `<span class="tag-pill" title="Click to copy tag" onclick="navigator.clipboard.writeText('${t}')">${t}</span>`).join('')}
+                    </div>
+                </div>`;
+            } else {
+                html += `<div class="tags-container"><small>Instruct/VoiceDesign mode: Uses rich natural-language persona prompts.</small></div>`;
+            }
+
+            document.getElementById('model-info').innerHTML = html;
+        }
+
+        function updateEstimate() {
+            const hours = parseFloat(document.getElementById('hours').value) || 1;
+            const count = Math.max(1, Math.round((hours * 3600) / 20));
+            document.getElementById('utterance-estimate').textContent =
+                `≈ ${count} utterances (${Math.round(hours * 60)} minutes of audio)`;
+        }
+
+        function updateTemplatePreview() {
+            const key = document.getElementById('model-select').value;
+            const m = models[key];
+            const speaker = document.getElementById('speaker-type').value || 'young female narrator';
+            if (!m) return;
+            const instruct = m.instruct_template.replace('{speaker_type}', speaker);
+            const tagsSample = m.inline_tags && m.inline_tags.length > 0
+                ? m.inline_tags.slice(0, 6).join(' ') + ' ...'
+                : 'None (Instruct VoiceDesign)';
+
+            document.getElementById('template-preview').innerHTML =
+                `<strong>--instruct template:</strong>\n${instruct}\n\n` +
+                `<strong>Available tags for LLM text synthesis:</strong>\n${tagsSample}\n\n` +
+                `<strong>Speaker persona:</strong>\n"${speaker}"\n` +
+                `Small LLM generates authentic conversational text embedded with these tags, perfectly conditioned for ${m.display_name}.`;
+        }
+
+        // --- Allocation Preview ---
+        async function previewAllocation() {
+            const body = {
+                model_key: document.getElementById('model-select').value,
+                speaker_type: document.getElementById('speaker-type').value,
+                hours: parseFloat(document.getElementById('hours').value),
+                output_dir: document.getElementById('output-dir').value,
+            };
+            try {
+                const resp = await fetch('/api/allocation', {
+                    method: 'POST', headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify(body),
+                });
+                const data = await resp.json();
+                const el = document.getElementById('allocation-preview');
+                el.innerHTML = `<strong>Total Parallel Workers: ${data.total_workers}</strong><br>` +
+                    data.gpus.map(g =>
+                        `${g.name} → ${g.workers} parallel worker(s) [backend: ${g.backend}]`
+                    ).join('<br>');
+                el.style.display = 'block';
+            } catch (e) {
+                alert('Failed to preview allocation: ' + e.message);
+            }
+        }
+
+        // --- Start Job ---
+        async function startJob() {
+            const body = {
+                model_key: document.getElementById('model-select').value,
+                speaker_type: document.getElementById('speaker-type').value,
+                hours: parseFloat(document.getElementById('hours').value),
+                output_dir: document.getElementById('output-dir').value,
+            };
+            if (!body.speaker_type) { alert('Enter a speaker type / persona description'); return; }
+
+            document.getElementById('btn-start').disabled = true;
+            document.getElementById('btn-start').textContent = '⏳ Submitting...';
+
+            try {
+                const resp = await fetch('/api/jobs/start', {
+                    method: 'POST', headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify(body),
+                });
+                const data = await resp.json();
+                document.getElementById('jobs-section').style.display = 'block';
+                startPolling();
+            } catch (e) {
+                alert('Failed to start job: ' + e.message);
+            } finally {
+                document.getElementById('btn-start').disabled = false;
+                document.getElementById('btn-start').textContent = '🚀 Start Dataset Generation';
+            }
+        }
+
+        // --- Job Polling ---
+        function startPolling() {
+            if (pollInterval) return;
+            pollInterval = setInterval(pollJobs, 2000);
+            pollJobs();
+        }
+
+        async function pollJobs() {
+            try {
+                const resp = await fetch('/api/jobs');
+                const jobs = await resp.json();
+                const el = document.getElementById('jobs-list');
+                if (jobs.length === 0) {
+                    el.innerHTML = '<p>No jobs yet.</p>';
+                    return;
+                }
+                el.innerHTML = jobs.map(j => `
+                    <div class="job-card ${j.status}">
+                        <div class="job-header">
+                            <span class="job-id">Job ${j.job_id}</span>
+                            <span class="job-status">${j.status}</span>
+                        </div>
+                        <div class="job-details">
+                            ${j.speaker_type} · ${j.hours}h · ${j.model_key}
+                        </div>
+                        <div class="progress-bar">
+                            <div class="progress-fill" style="width: ${j.progress}%"></div>
+                        </div>
+                        <div class="job-stats">
+                            ${j.completed_utterances}/${j.total_utterances} utterances synthesized · ${j.progress}% complete
+                            ${j.error ? `<br><span class="error">${j.error}</span>` : ''}
+                        </div>
+                    </div>
+                `).join('');
+
+                if (jobs.every(j => j.status === 'done' || j.status === 'error')) {
+                    clearInterval(pollInterval);
+                    pollInterval = null;
+                }
+            } catch (e) {
+                console.error('Poll failed:', e);
+            }
+        }
+
+        // --- Event Listeners ---
+        document.getElementById('hours').addEventListener('input', updateEstimate);
+        document.getElementById('speaker-type').addEventListener('input', updateTemplatePreview);
+
+        // Boot
+        init();
+    </script>
+</body>
+</html>

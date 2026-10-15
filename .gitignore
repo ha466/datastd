@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Packaging
+dist/
+build/
+*.egg-info/
+
+# Environments
+.venv/
+env/
+venv/
+.env
+
+# Large runtime assets & artifacts
+bin/
+models/
+output/
+*.gguf
+*.tar.gz
+*.zip
+
+# Operating System & IDE
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
