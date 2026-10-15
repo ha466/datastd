@@ -26,7 +26,13 @@ LLM_BASE_URL = os.environ.get("LLM_BASE_URL", f"http://127.0.0.1:{LLM_PORT}/v1")
 LLM_MODEL = os.environ.get("LLM_MODEL", "qwen2.5-1.5b-instruct-q4_k_m.gguf")
 LLM_API_KEY = os.environ.get("LLM_API_KEY", "local")
 LLM_PARALLEL = max(1, int(os.environ.get("LLM_PARALLEL", "2")))
+LLM_BATCH_SIZE = max(1, int(os.environ.get("LLM_BATCH_SIZE", "4")))
 LLM_CONTEXT_SIZE = max(512, int(os.environ.get("LLM_CONTEXT_SIZE", "4096")))
+LLM_SYSTEM_PROMPT = (
+    "You are a specialized TTS text dataset generator. "
+    "Follow the user instructions precisely. Output ONLY the natural spoken text "
+    "with requested tags. Do NOT output conversational chatter, quotes, or markdown formatting."
+)
 
 # Subprocess handle for native llama-server
 _llama_process: subprocess.Popen | None = None
@@ -250,6 +256,10 @@ def stop_llama_server():
 atexit.register(stop_llama_server)
 
 
+class _BatchEndpointUnavailable(Exception):
+    """Raised when the configured endpoint does not expose llama.cpp batch routes."""
+
+
 async def _ensure_llm_server() -> None:
     """Ensure the configured OpenAI-compatible endpoint is available."""
     if not await asyncio.to_thread(is_llm_server_running):
@@ -261,21 +271,32 @@ async def _ensure_llm_server() -> None:
                 "or point LLM_BASE_URL to an external endpoint."
             )
 
-async def _generate_text_with_client(client: httpx.AsyncClient, prompt: str) -> str:
+def _llama_root_url() -> str:
+    """Return the root URL for llama.cpp's non-OpenAI-compatible routes."""
+    base_url = LLM_BASE_URL.rstrip("/")
+    if base_url.endswith("/v1"):
+        return base_url[:-3]
+    return base_url
+
+
+def _clean_generated_text(text: str) -> str:
+    text = text.strip()
+    if "<think>" in text:
+        text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+    if (text.startswith('"') and text.endswith('"')) or (text.startswith("'") and text.endswith("'")):
+        text = text[1:-1].strip()
+    return text
+
+
+async def _generate_chat_text_with_client(client: httpx.AsyncClient, prompt: str) -> str:
+    """Generate one result through an OpenAI-compatible chat endpoint."""
     resp = await client.post(
-        f"{LLM_BASE_URL}/chat/completions",
+        f"{LLM_BASE_URL.rstrip('/')}/chat/completions",
         headers={"Authorization": f"Bearer {LLM_API_KEY}"},
         json={
             "model": LLM_MODEL,
             "messages": [
-                {
-                    "role": "system",
-                    "content": (
-                        "You are a specialized TTS text dataset generator. "
-                        "Follow the user instructions precisely. Output ONLY the natural spoken text "
-                        "with requested tags. Do NOT output conversational chatter, quotes, or markdown formatting."
-                    ),
-                },
+                {"role": "system", "content": LLM_SYSTEM_PROMPT},
                 {"role": "user", "content": prompt},
             ],
             "temperature": 0.8,
@@ -285,13 +306,93 @@ async def _generate_text_with_client(client: httpx.AsyncClient, prompt: str) -> 
     )
     resp.raise_for_status()
     data = resp.json()
-    text = data["choices"][0]["message"]["content"].strip()
+    text = data["choices"][0]["message"]["content"]
+    return _clean_generated_text(text)
 
-    if "<think>" in text:
-        text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
-    if (text.startswith('"') and text.endswith('"')) or (text.startswith("'") and text.endswith("'")):
-        text = text[1:-1].strip()
-    return text
+
+async def _prepare_llama_batch_prompt_with_client(
+    client: httpx.AsyncClient,
+    prompt: str,
+) -> str:
+    """Format the chat once using the loaded model's llama.cpp template."""
+    headers = {"Authorization": f"Bearer {LLM_API_KEY}"}
+    root_url = _llama_root_url()
+    messages = [
+        {"role": "system", "content": LLM_SYSTEM_PROMPT},
+        {"role": "user", "content": prompt},
+    ]
+
+    template_response = await client.post(
+        f"{root_url}/apply-template",
+        headers=headers,
+        json={"messages": messages},
+    )
+    if template_response.status_code in (404, 405, 501):
+        raise _BatchEndpointUnavailable("llama.cpp /apply-template route is unavailable")
+    template_response.raise_for_status()
+    templated_prompt = template_response.json().get("prompt")
+    if not isinstance(templated_prompt, str) or not templated_prompt:
+        raise RuntimeError("llama.cpp /apply-template returned no prompt")
+    return templated_prompt
+
+
+async def _generate_llama_batch_with_client(
+    client: httpx.AsyncClient,
+    templated_prompt: str,
+    count: int,
+) -> list[str]:
+    """Generate independent samples in one llama.cpp multi-prompt request."""
+    headers = {"Authorization": f"Bearer {LLM_API_KEY}"}
+    root_url = _llama_root_url()
+    response = await client.post(
+        f"{root_url}/completion",
+        headers=headers,
+        json={
+            "prompt": [templated_prompt] * count,
+            "temperature": 0.8,
+            "n_predict": 512,
+            "stop": ["\n\n\n", "<|im_end|>", "<|endoftext|>"],
+            "cache_prompt": True,
+        },
+    )
+    if response.status_code in (404, 405, 501):
+        raise _BatchEndpointUnavailable("llama.cpp /completion batch route is unavailable")
+    response.raise_for_status()
+    data = response.json()
+    # The pinned llama.cpp server returns an array for multiple prompts and a
+    # single object when the batch contains exactly one prompt.
+    completions = data if isinstance(data, list) else [data]
+    texts: list[str] = []
+    for completion in completions:
+        if isinstance(completion, dict) and isinstance(completion.get("content"), str):
+            texts.append(_clean_generated_text(completion["content"]))
+        else:
+            texts.append("")
+    texts.extend([""] * max(0, count - len(texts)))
+    return texts[:count]
+
+
+async def _generate_chat_batch_with_client(
+    client: httpx.AsyncClient,
+    prompt: str,
+    count: int,
+) -> list[str]:
+    """Generate a fallback batch concurrently within the configured slot count."""
+    semaphore = asyncio.Semaphore(LLM_PARALLEL)
+
+    async def generate_one(index: int) -> str:
+        async with semaphore:
+            try:
+                return await _generate_chat_text_with_client(client, prompt)
+            except Exception as exc:
+                log.warning("Text generation %s failed: %s", index + 1, exc)
+                return ""
+
+    return await asyncio.gather(*(generate_one(index) for index in range(count)))
+
+
+async def _generate_text_with_client(client: httpx.AsyncClient, prompt: str) -> str:
+    return await _generate_chat_text_with_client(client, prompt)
 
 
 async def generate_text(prompt: str) -> str:
@@ -302,60 +403,59 @@ async def generate_text(prompt: str) -> str:
 
 
 async def generate_batch(prompt: str, count: int, on_progress=None, on_text=None) -> list[str]:
-    """Generate a bounded batch concurrently, optionally streaming each result to a consumer."""
+    """Generate text in llama.cpp prompt batches, with chat API fallback."""
     if count <= 0:
         return []
     await _ensure_llm_server()
 
-    indices: asyncio.Queue[int | None] = asyncio.Queue()
-    for index in range(count):
-        indices.put_nowait(index)
-    worker_count = min(count, LLM_PARALLEL)
-    for _ in range(worker_count):
-        indices.put_nowait(None)
-
-    results: list[str | None] = [None] * count
+    results: list[str] = []
     completed = 0
     stopped = False
-    limits = httpx.Limits(max_connections=worker_count, max_keepalive_connections=worker_count)
+    batch_api_available: bool | None = None
+    templated_prompt: str | None = None
+    batch_size = min(count, LLM_BATCH_SIZE)
+    limits = httpx.Limits(max_connections=max(1, LLM_PARALLEL), max_keepalive_connections=max(1, LLM_PARALLEL))
 
     async with httpx.AsyncClient(timeout=120, limits=limits) as client:
-        async def worker() -> None:
-            nonlocal completed, stopped
-            while True:
-                index = await indices.get()
-                try:
-                    if index is None:
-                        return
-                    if not stopped:
-                        try:
-                            text = await _generate_text_with_client(client, prompt)
-                        except Exception as exc:
-                            log.warning("Text generation %s failed: %s", index + 1, exc)
-                            if not await asyncio.to_thread(is_llm_server_running):
-                                log.error("LLM server is unavailable. Aborting remaining text requests.")
-                                stopped = True
-                        else:
-                            if text:
-                                results[index] = text
-                                if on_text:
-                                    accepted = await on_text(text)
-                                    if accepted is False:
-                                        stopped = True
-                            log.info("Generated text %s/%s", index + 1, count)
-                    completed += 1
-                    if on_progress:
-                        on_progress(completed, count)
-                finally:
-                    indices.task_done()
+        for batch_start in range(0, count, batch_size):
+            if stopped:
+                break
+            current_size = min(batch_size, count - batch_start)
+            try:
+                if batch_api_available is not False:
+                    if templated_prompt is None:
+                        templated_prompt = await _prepare_llama_batch_prompt_with_client(client, prompt)
+                    batch_api_available = True
+                    batch_texts = await _generate_llama_batch_with_client(
+                        client,
+                        templated_prompt,
+                        current_size,
+                    )
+                else:
+                    batch_texts = await _generate_chat_batch_with_client(client, prompt, current_size)
+            except _BatchEndpointUnavailable:
+                batch_api_available = False
+                log.info("llama.cpp batch routes unavailable; using concurrent OpenAI-compatible chat requests")
+                batch_texts = await _generate_chat_batch_with_client(client, prompt, current_size)
+            except Exception as exc:
+                log.warning("Text generation batch %s failed: %s", batch_start // batch_size + 1, exc)
+                if not await asyncio.to_thread(is_llm_server_running):
+                    log.error("LLM server is unavailable. Aborting remaining text batches.")
+                    stopped = True
+                batch_texts = []
 
-        workers = [asyncio.create_task(worker()) for _ in range(worker_count)]
-        try:
-            await asyncio.gather(*workers)
-        except BaseException:
-            for task in workers:
-                task.cancel()
-            await asyncio.gather(*workers, return_exceptions=True)
-            raise
+            for index in range(current_size):
+                text = batch_texts[index] if index < len(batch_texts) else ""
+                if text:
+                    results.append(text)
+                completed += 1
+                if on_progress:
+                    on_progress(completed, count)
+                if text and on_text:
+                    accepted = await on_text(text)
+                    if accepted is False:
+                        stopped = True
+                        break
+                log.info("Completed text request %s/%s", completed, count)
 
-    return [text for text in results if text]
+    return results

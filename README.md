@@ -93,7 +93,8 @@ curl -X POST http://localhost:7860/api/jobs/start \
 | `PORT` | `7860` | Server port |
 | `LLM_PORT` | `8080` | Native llama-server port |
 | `LLM_MODEL` | `qwen2.5-1.5b-instruct-q4_k_m.gguf` | Local GGUF LLM filename in `models/` |
-| `LLM_PARALLEL` | `2` | Concurrent llama-server slots and text requests |
+| `LLM_PARALLEL` | `2` | llama-server decoding slots for concurrent samples |
+| `LLM_BATCH_SIZE` | `4` | Independent prompts included in each native llama.cpp batch request |
 | `LLM_CONTEXT_SIZE` | `4096` | Total llama-server context size shared across slots |
 | `LLM_BASE_URL` | `http://127.0.0.1:8080/v1` | OpenAI-compatible endpoint (local or remote) |
 | `TTS_TEXT_BATCH_MAX` | `64` | Maximum generated-text batch before valid-audio duration is measured again |
