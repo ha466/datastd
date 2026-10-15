@@ -89,22 +89,28 @@ def setup_uv():
 
 
 def ensure_repo():
-    """Ensure project directory exists and is active."""
+    """Ensure project directory exists and is updated to latest."""
     cwd = Path.cwd().resolve()
-    if (cwd / "pyproject.toml").exists() and (cwd / "datastd").exists():
-        return cwd
-
     kaggle_working = Path("/kaggle/working/datastd")
-    if (kaggle_working / "pyproject.toml").exists():
-        os.chdir(kaggle_working)
-        return kaggle_working
 
-    # Auto-clone repository if not present
-    print(f"[SETUP] Cloning DataSTD repository from {REPO_URL}...")
-    kaggle_working.parent.mkdir(parents=True, exist_ok=True)
-    run(f"git clone {REPO_URL} {kaggle_working}")
-    os.chdir(kaggle_working)
-    return kaggle_working
+    target = cwd if (cwd / "pyproject.toml").exists() and (cwd / "datastd").exists() else kaggle_working
+
+    if (target / ".git").exists():
+        print(f"[SETUP] Updating repository in {target} to latest version...")
+        try:
+            subprocess.run(["git", "pull", "--rebase"], cwd=str(target), check=False)
+        except Exception:
+            pass
+        os.chdir(target)
+        return target
+
+    if not (target / "pyproject.toml").exists():
+        print(f"[SETUP] Cloning DataSTD repository from {REPO_URL}...")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        run(f"git clone {REPO_URL} {target}")
+
+    os.chdir(target)
+    return target
 
 
 def start_optional_ngrok(port: int) -> str | None:
