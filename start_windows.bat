@@ -29,6 +29,6 @@ if not exist "models" (
 
 REM Start the server
 echo [START] Launching DataSTD server...
-uv run datastd
+uv run python -m datastd.server
 
 pause

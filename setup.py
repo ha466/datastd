@@ -77,7 +77,10 @@ def _extract_archive(archive_path: Path, dest_dir: Path):
     """Extract tar.gz or zip archive."""
     if archive_path.suffix == ".gz" or str(archive_path).endswith(".tar.gz"):
         with tarfile.open(archive_path, "r:gz") as tar:
-            tar.extractall(dest_dir)
+            if hasattr(tarfile, "data_filter"):
+                tar.extractall(dest_dir, filter="data")
+            else:
+                tar.extractall(dest_dir)
     elif archive_path.suffix == ".zip":
         with zipfile.ZipFile(archive_path, "r") as zf:
             zf.extractall(dest_dir)
@@ -181,7 +184,7 @@ def main():
             setup_models(DEFAULT_MODELS)
 
     print("\n✓ Setup complete!")
-    print("  Run DataSTD with: `uv run datastd`")
+    print("  Run DataSTD with: `uv run python -m datastd.server`")
 
 
 if __name__ == "__main__":

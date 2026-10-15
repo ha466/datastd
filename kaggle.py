@@ -130,6 +130,7 @@ def main():
     print("=" * 70)
 
     # 1. Setup uv
+    os.environ["UV_LINK_MODE"] = "copy"
     setup_uv()
 
     # 2. Locate or clone project
@@ -154,7 +155,7 @@ def main():
     print("=" * 70 + "\n")
 
     # 5. Start datastd server (FastAPI + pycloudflared tunnel + auto llama-server)
-    run("uv run datastd")
+    run("uv run python -m datastd.server")
 
 
 if __name__ == "__main__":
