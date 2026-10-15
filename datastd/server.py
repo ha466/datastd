@@ -8,14 +8,14 @@ import os
 import uuid
 from pathlib import Path
 
-from fastapi import FastAPI, BackgroundTasks
+from fastapi import FastAPI, BackgroundTasks, HTTPException
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from .gpu import build_allocation, detect_gpus
 from .models import MODELS
-from .pipeline import Job, get_job, list_jobs, run_job
+from .pipeline import Job, get_job, list_jobs, run_job, upload_job_to_huggingface
 from .textgen import is_llm_server_running, LLM_MODEL
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -36,6 +36,15 @@ class StartJobRequest(BaseModel):
     speaker_type: str
     hours: float
     output_dir: str = "output"
+    hf_repo_id: str | None = None
+    hf_token: str | None = None
+    hf_private: bool = False
+
+
+class UploadHfRequest(BaseModel):
+    repo_id: str
+    token: str | None = None
+    private: bool = False
 
 
 # --- Routes ---
@@ -91,6 +100,9 @@ async def api_start_job(req: StartJobRequest, bg: BackgroundTasks):
         speaker_type=req.speaker_type,
         hours=req.hours,
         output_dir=os.path.join(req.output_dir, job_id),
+        hf_repo_id=req.hf_repo_id,
+        hf_token=req.hf_token,
+        hf_private=req.hf_private,
     )
     bg.add_task(run_job, job)
     return {"job_id": job_id, "status": "started"}
@@ -107,8 +119,31 @@ async def api_get_job(job_id: str):
     """Get job status."""
     job = get_job(job_id)
     if not job:
-        return {"error": "Job not found"}
+        raise HTTPException(status_code=404, detail="Job not found")
     return job.to_dict()
+
+
+@app.post("/api/jobs/{job_id}/upload_hf")
+async def api_upload_hf(job_id: str, req: UploadHfRequest):
+    """Upload completed job output directory to Hugging Face Hub dataset repo."""
+    job = get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if not job.output_dir.exists():
+        raise HTTPException(status_code=400, detail="Job output directory does not exist")
+
+    try:
+        url = upload_job_to_huggingface(
+            job_dir=job.output_dir,
+            repo_id=req.repo_id,
+            token=req.token,
+            private=req.private,
+        )
+        job.hf_url = url
+        job.hf_repo_id = req.repo_id
+        return {"status": "ok", "url": url, "repo_id": req.repo_id}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 PUBLIC_TUNNEL_URL: str | None = None

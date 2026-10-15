@@ -92,12 +92,16 @@ def test_pipeline():
         speaker_type="young female",
         hours=0.5,
         output_dir="output/test1234",
+        hf_repo_id="testuser/test-dataset",
+        hf_private=True,
     )
     d = job.to_dict()
     assert d["job_id"] == "test1234"
     assert d["status"] == "pending"
     assert d["progress"] == 0
-    print("[OK] Pipeline estimation and job tracking verified.")
+    assert d["hf_repo_id"] == "testuser/test-dataset"
+    assert "hf_url" in d
+    print("[OK] Pipeline estimation and job tracking (with HF Hub support) verified.")
 
 
 if __name__ == "__main__":

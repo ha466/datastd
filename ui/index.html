@@ -59,6 +59,18 @@
                     <input type="text" id="output-dir" value="output">
                 </div>
 
+                <div class="form-group" style="margin-top:14px; border-top:1px dashed #30363d; padding-top:14px;">
+                    <label for="hf-repo-id">🤗 Hugging Face Dataset Hub (Optional)</label>
+                    <input type="text" id="hf-repo-id" placeholder="e.g. username/my-voice-dataset">
+                    <small>Auto-upload audio WAVs and manifests to Hugging Face Hub on completion.</small>
+                </div>
+                <div class="form-group" style="display:flex; gap:12px; align-items:center;">
+                    <input type="password" id="hf-token" placeholder="HF Write Token (optional if HF_TOKEN env var is set)" style="flex:1;">
+                    <label style="display:flex; align-items:center; gap:6px; font-size:0.82rem; margin:0; cursor:pointer;">
+                        <input type="checkbox" id="hf-private" style="width:auto;"> Private
+                    </label>
+                </div>
+
                 <!-- Allocation Preview -->
                 <div id="allocation-preview" class="allocation-preview"></div>
 
@@ -259,6 +271,9 @@
                 speaker_type: document.getElementById('speaker-type').value,
                 hours: parseFloat(document.getElementById('hours').value),
                 output_dir: document.getElementById('output-dir').value,
+                hf_repo_id: document.getElementById('hf-repo-id').value.trim() || null,
+                hf_token: document.getElementById('hf-token').value.trim() || null,
+                hf_private: document.getElementById('hf-private').checked,
             };
             if (!body.speaker_type) { alert('Enter a speaker type / persona description'); return; }
 
@@ -278,6 +293,30 @@
             } finally {
                 document.getElementById('btn-start').disabled = false;
                 document.getElementById('btn-start').textContent = '🚀 Start Dataset Generation';
+            }
+        }
+
+        // --- Manual Upload to Hugging Face ---
+        async function uploadHf(jobId) {
+            const repoId = prompt('Enter Hugging Face dataset repository ID (e.g. username/my-voice-dataset):');
+            if (!repoId) return;
+            const token = prompt('Enter Hugging Face write token (leave blank to use server HF_TOKEN env var):') || null;
+
+            try {
+                const resp = await fetch(`/api/jobs/${jobId}/upload_hf`, {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({repo_id: repoId.trim(), token: token, private: false}),
+                });
+                const data = await resp.json();
+                if (data.url) {
+                    alert('Dataset uploaded successfully!\n' + data.url);
+                    pollJobs();
+                } else {
+                    alert('Upload failed: ' + (data.detail || JSON.stringify(data)));
+                }
+            } catch (e) {
+                alert('Upload error: ' + e.message);
             }
         }
 
@@ -311,6 +350,8 @@
                         </div>
                         <div class="job-stats">
                             ${j.completed_utterances}/${j.total_utterances} utterances synthesized · ${j.progress}% complete
+                            ${j.hf_url ? `<div style="margin-top:6px;"><a href="${j.hf_url}" target="_blank" style="color:#7ee787; font-weight:600; text-decoration:none;">🤗 View Dataset on Hugging Face ↗</a></div>` : ''}
+                            ${j.status === 'done' && !j.hf_url ? `<div style="margin-top:6px;"><button class="btn btn-secondary" style="padding:4px 10px; font-size:0.75rem; margin:0;" onclick="uploadHf('${j.job_id}')">🤗 Upload to Hugging Face</button></div>` : ''}
                             ${j.error ? `<br><span class="error">${j.error}</span>` : ''}
                         </div>
                     </div>

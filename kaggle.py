@@ -54,7 +54,12 @@ You can control dataset generation remotely via the Gateway URL:
 5. Poll Job Status & Progress:
    curl https://<gateway-url>/api/jobs/<job_id>
 
-6. List All Jobs:
+6. Upload Dataset to Hugging Face Hub:
+   curl -X POST https://<gateway-url>/api/jobs/<job_id>/upload_hf \\
+     -H "Content-Type: application/json" \\
+     -d '{"repo_id": "username/voice-dataset", "token": "hf_..."}'
+
+7. List All Jobs:
    curl https://<gateway-url>/api/jobs
 """
 
