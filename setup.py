@@ -78,7 +78,7 @@ def _extract_archive(archive_path: Path, dest_dir: Path):
     if archive_path.suffix == ".gz" or str(archive_path).endswith(".tar.gz"):
         with tarfile.open(archive_path, "r:gz") as tar:
             if hasattr(tarfile, "data_filter"):
-                tar.extractall(dest_dir, filter="data")
+                tar.extractall(dest_dir, filter="tar")
             else:
                 tar.extractall(dest_dir)
     elif archive_path.suffix == ".zip":
@@ -121,13 +121,21 @@ def setup_binaries(platform: str):
 
     for root, dirs, files in os.walk(bin_dir):
         for f in files:
-            if f in (cli_name, llama_name) or f.endswith(".dll") or f.endswith(".so"):
+            if f in (cli_name, llama_name) or f.endswith(".dll") or ".so" in f:
                 src = Path(root) / f
                 dst = bin_dir / f
-                if src != dst and not dst.exists():
-                    shutil.copy2(src, dst)
-                if platform != "windows" and f in (cli_name, llama_name):
-                    os.chmod(dst, 0o755)
+                if src.resolve() != dst.resolve():
+                    try:
+                        if dst.is_symlink() or dst.exists():
+                            dst.unlink()
+                        shutil.copy2(src, dst, follow_symlinks=True)
+                    except Exception:
+                        pass
+                if platform != "windows":
+                    try:
+                        os.chmod(dst, 0o755)
+                    except Exception:
+                        pass
 
     print(f"  [OK] audio.cpp CLI ready: {bin_dir / cli_name}")
     print(f"  [OK] llama-server ready:  {bin_dir / llama_name}")

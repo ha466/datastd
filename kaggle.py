@@ -98,7 +98,8 @@ def ensure_repo():
     if (target / ".git").exists():
         print(f"[SETUP] Updating repository in {target} to latest version...")
         try:
-            subprocess.run(["git", "pull", "--rebase"], cwd=str(target), check=False)
+            subprocess.run(["git", "fetch", "origin", "main"], cwd=str(target), check=False)
+            subprocess.run(["git", "reset", "--hard", "origin/main"], cwd=str(target), check=False)
         except Exception:
             pass
         os.chdir(target)

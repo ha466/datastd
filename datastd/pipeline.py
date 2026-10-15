@@ -113,16 +113,30 @@ def list_jobs() -> list[dict]:
 
 
 def _find_cli() -> str:
-    """Find the audiocpp_cli binary. Checks ./bin/ then PATH."""
-    candidates = [
-        Path("bin/audiocpp_cli"),
-        Path("bin/audiocpp_cli.exe"),
+    """Find the audiocpp_cli binary. Checks ./bin/ (including subdirs) then PATH."""
+    candidates = []
+    bin_dir = Path("bin")
+    if bin_dir.exists():
+        for name in ("audiocpp_cli", "audiocpp_cli.exe"):
+            p = bin_dir / name
+            if p.exists() and p.is_file():
+                candidates.append(p)
+        for p in bin_dir.rglob("audiocpp_cli*"):
+            if p.is_file() and p.name in ("audiocpp_cli", "audiocpp_cli.exe"):
+                if p not in candidates:
+                    candidates.append(p)
+
+    candidates.extend([
         Path("audiocpp_cli"),
-    ]
+        Path("audiocpp_cli.exe"),
+    ])
     for c in candidates:
-        if c.exists():
+        if c.exists() and c.is_file():
             return str(c.resolve())
     # Fall back to PATH
+    which_bin = shutil.which("audiocpp_cli")
+    if which_bin:
+        return which_bin
     return "audiocpp_cli"
 
 
@@ -141,6 +155,13 @@ async def _synthesize_one(
     semaphore: asyncio.Semaphore,
 ) -> bool:
     """Run a single audiocpp_cli TTS call."""
+    cli_path = Path(cli)
+    if os.name != "nt" and cli_path.exists():
+        try:
+            os.chmod(cli_path, 0o755)
+        except Exception:
+            pass
+
     cmd = build_cli_args(
         cli=cli,
         model_key=model_key,
@@ -155,9 +176,16 @@ async def _synthesize_one(
     if backend == "cuda" and gpu_index >= 0:
         env["CUDA_VISIBLE_DEVICES"] = str(gpu_index)
 
-    # Ensure binary's directory is in PATH so dynamic libraries are located
-    bin_dir = str(Path(cli).parent.resolve())
-    env["PATH"] = bin_dir + os.pathsep + env.get("PATH", "")
+    # Ensure binary's directory and all bin subdirs are in PATH and LD_LIBRARY_PATH
+    lib_dirs = [str(cli_path.parent.resolve()), str(Path("bin").resolve())]
+    if Path("bin").exists():
+        for p in Path("bin").iterdir():
+            if p.is_dir():
+                lib_dirs.append(str(p.resolve()))
+
+    ld_str = os.pathsep.join(dict.fromkeys(lib_dirs))
+    env["LD_LIBRARY_PATH"] = ld_str + (os.pathsep + env["LD_LIBRARY_PATH"] if "LD_LIBRARY_PATH" in env else "")
+    env["PATH"] = ld_str + os.pathsep + env.get("PATH", "")
 
     async with semaphore:
         try:

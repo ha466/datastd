@@ -16,12 +16,25 @@ from pydantic import BaseModel
 from .gpu import build_allocation, detect_gpus
 from .models import MODELS
 from .pipeline import Job, get_job, list_jobs, run_job, upload_job_to_huggingface
-from .textgen import is_llm_server_running, LLM_MODEL
+from .textgen import is_llm_server_running, start_llama_server, stop_llama_server, LLM_MODEL
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger(__name__)
 
 app = FastAPI(title="DataSTD — Synthetic Voice Dataset Generator")
+
+
+@app.on_event("startup")
+async def on_startup():
+    """Warm up or auto-launch llama-server in background if binary & model exist."""
+    asyncio.create_task(asyncio.to_thread(start_llama_server))
+
+
+@app.on_event("shutdown")
+def on_shutdown():
+    """Cleanly terminate llama-server on shutdown."""
+    stop_llama_server()
+
 
 # Serve static UI files
 UI_DIR = Path(__file__).parent.parent / "ui"
@@ -172,7 +185,16 @@ def main():
     try:
         from pycloudflared import try_cloudflare
         tunnel = try_cloudflare(port=port)
-        PUBLIC_TUNNEL_URL = getattr(tunnel, "tunnel_url", str(tunnel))
+        if hasattr(tunnel, "tunnel") and isinstance(tunnel.tunnel, str):
+            PUBLIC_TUNNEL_URL = tunnel.tunnel
+        elif hasattr(tunnel, "tunnel_url") and isinstance(tunnel.tunnel_url, str):
+            PUBLIC_TUNNEL_URL = tunnel.tunnel_url
+        else:
+            raw_str = str(tunnel)
+            # Match http or https URL if string contains repr
+            import re
+            m = re.search(r"https?://[^\s,'\"]+", raw_str)
+            PUBLIC_TUNNEL_URL = m.group(0) if m else raw_str
         print("\n" + "=" * 60)
         print(f"  DataSTD Public Tunnel URL: {PUBLIC_TUNNEL_URL}")
         print("=" * 60 + "\n")

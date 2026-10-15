@@ -104,8 +104,33 @@ def test_pipeline():
     print("[OK] Pipeline estimation and job tracking (with HF Hub support) verified.")
 
 
+def test_binary_discovery():
+    import tempfile
+    import os
+    from pathlib import Path
+    from datastd.textgen import find_llama_server
+    from datastd.pipeline import _find_cli
+
+    # Test nested bin discovery
+    test_bin = Path("bin/test_llama_dir")
+    test_bin.mkdir(parents=True, exist_ok=True)
+    dummy_server = test_bin / ("llama-server.exe" if os.name == "nt" else "llama-server")
+    dummy_server.write_text("dummy")
+
+    try:
+        found = find_llama_server()
+        assert found is not None, "Failed to locate nested llama-server in bin subfolder"
+        assert "llama-server" in found
+    finally:
+        dummy_server.unlink(missing_ok=True)
+        test_bin.rmdir()
+
+    print("[OK] Binary discovery (including subdirectories) verified.")
+
+
 if __name__ == "__main__":
     test_models()
     test_gpu_allocation()
     test_pipeline()
+    test_binary_discovery()
     print("\nALL CHECKS PASSED!")
