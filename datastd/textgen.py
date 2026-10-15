@@ -141,13 +141,25 @@ def start_llama_server() -> bool:
         except Exception:
             pass
 
-    # Build LD_LIBRARY_PATH and PATH with server's directory and all bin subdirectories
+    # Build LD_LIBRARY_PATH and PATH with server's directory, all bin subdirectories, and CUDA paths
     env = os.environ.copy()
     lib_dirs = [str(server_path.parent.resolve()), str(Path("bin").resolve())]
     if Path("bin").exists():
         for p in Path("bin").iterdir():
             if p.is_dir():
                 lib_dirs.append(str(p.resolve()))
+
+    # Include system CUDA paths if present (Kaggle / Colab / Ubuntu)
+    for cuda_candidate in (
+        "/usr/local/cuda/lib64",
+        "/usr/local/cuda-12/lib64",
+        "/usr/local/cuda-12.8/lib64",
+        "/usr/local/cuda-12.4/lib64",
+        "/usr/local/cuda-12.2/lib64",
+        "/usr/lib/x86_64-linux-gnu",
+    ):
+        if Path(cuda_candidate).exists():
+            lib_dirs.append(cuda_candidate)
 
     ld_str = os.pathsep.join(dict.fromkeys(lib_dirs))
     env["LD_LIBRARY_PATH"] = ld_str + (os.pathsep + env["LD_LIBRARY_PATH"] if "LD_LIBRARY_PATH" in env else "")

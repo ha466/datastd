@@ -6,6 +6,7 @@ import asyncio
 import logging
 import os
 import uuid
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, BackgroundTasks, HTTPException
@@ -21,19 +22,16 @@ from .textgen import is_llm_server_running, start_llama_server, stop_llama_serve
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger(__name__)
 
-app = FastAPI(title="DataSTD — Synthetic Voice Dataset Generator")
 
-
-@app.on_event("startup")
-async def on_startup():
-    """Warm up or auto-launch llama-server in background if binary & model exist."""
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Lifespan context: warm up llama-server on boot, cleanly stop on shutdown."""
     asyncio.create_task(asyncio.to_thread(start_llama_server))
-
-
-@app.on_event("shutdown")
-def on_shutdown():
-    """Cleanly terminate llama-server on shutdown."""
+    yield
     stop_llama_server()
+
+
+app = FastAPI(title="DataSTD — Synthetic Voice Dataset Generator", lifespan=lifespan)
 
 
 # Serve static UI files

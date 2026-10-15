@@ -121,11 +121,15 @@ def test_binary_discovery():
         found = find_llama_server()
         assert found is not None, "Failed to locate nested llama-server in bin subfolder"
         assert "llama-server" in found
+
+        # Verify _find_cli executes safely
+        cli_result = _find_cli()
+        assert isinstance(cli_result, str), "_find_cli should return string binary path or name"
     finally:
         dummy_server.unlink(missing_ok=True)
         test_bin.rmdir()
 
-    print("[OK] Binary discovery (including subdirectories) verified.")
+    print("[OK] Binary discovery (including subdirectories and _find_cli) verified.")
 
 
 if __name__ == "__main__":

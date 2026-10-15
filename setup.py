@@ -31,6 +31,17 @@ AUDIO_BINARIES = {
 
 LLAMA_BINARIES = {
     "linux": {
+        "url": "https://github.com/ggml-org/llama.cpp/releases/download/b11658/llama-b11658-bin-ubuntu-cuda-12.8-x64.tar.gz",
+        "filename": "llama-b11658-bin-ubuntu-cuda-12.8-x64.tar.gz",
+    },
+    "windows": {
+        "url": "https://github.com/ggml-org/llama.cpp/releases/download/b11658/llama-b11658-bin-win-cuda-12.4-x64.zip",
+        "filename": "llama-b11658-bin-win-cuda-12.4-x64.zip",
+    },
+}
+
+LLAMA_CPU_BINARIES = {
+    "linux": {
         "url": "https://github.com/ggml-org/llama.cpp/releases/download/b11658/llama-b11658-bin-ubuntu-x64.tar.gz",
         "filename": "llama-b11658-bin-ubuntu-x64.tar.gz",
     },
@@ -86,16 +97,16 @@ def _extract_archive(archive_path: Path, dest_dir: Path):
             zf.extractall(dest_dir)
 
 
-def setup_binaries(platform: str):
-    """Download and extract both audio.cpp and llama.cpp binaries."""
+def setup_binaries(platform: str, use_cpu: bool = False):
+    """Download and extract both audio.cpp and llama.cpp binaries (CUDA GPU accelerated by default)."""
     bin_dir = Path("bin")
     bin_dir.mkdir(exist_ok=True)
 
-    # 1. audio.cpp
+    # 1. audio.cpp (CUDA GPU build)
     audio_info = AUDIO_BINARIES[platform]
     audio_archive = bin_dir / audio_info["filename"]
     if not audio_archive.exists():
-        print(f"\n[1/4] Downloading audio.cpp binary ({platform})...")
+        print(f"\n[1/4] Downloading audio.cpp binary ({platform} CUDA GPU)...")
         download(audio_info["url"], str(audio_archive))
     else:
         print(f"\n[1/4] audio.cpp binary archive already exists: {audio_archive}")
@@ -103,14 +114,15 @@ def setup_binaries(platform: str):
     print(f"  Extracting audio.cpp to {bin_dir}/...")
     _extract_archive(audio_archive, bin_dir)
 
-    # 2. llama.cpp (llama-server)
-    llama_info = LLAMA_BINARIES[platform]
+    # 2. llama.cpp (llama-server) — CUDA GPU by default for high-speed LLM text generation
+    llama_info = LLAMA_CPU_BINARIES[platform] if use_cpu else LLAMA_BINARIES[platform]
     llama_archive = bin_dir / llama_info["filename"]
+    mode_str = "CPU-only" if use_cpu else "CUDA GPU"
     if not llama_archive.exists():
-        print(f"\n[2/4] Downloading llama.cpp binary ({platform})...")
+        print(f"\n[2/4] Downloading llama.cpp binary ({platform} {mode_str})...")
         download(llama_info["url"], str(llama_archive))
     else:
-        print(f"\n[2/4] llama.cpp binary archive already exists: {llama_archive}")
+        print(f"\n[2/4] llama.cpp binary archive already exists ({mode_str}): {llama_archive}")
 
     print(f"  Extracting llama.cpp to {bin_dir}/...")
     _extract_archive(llama_archive, bin_dir)
@@ -167,6 +179,7 @@ def main():
     parser.add_argument("--binary-only", action="store_true", help="Download binaries only")
     parser.add_argument("--models-only", action="store_true", help="Download models only")
     parser.add_argument("--llm-only", action="store_true", help="Download LLM model only")
+    parser.add_argument("--cpu", action="store_true", help="Download CPU-only llama-server instead of CUDA GPU")
     parser.add_argument("--model", action="append", help="Download specific model(s) by filename")
     args = parser.parse_args()
 
@@ -176,7 +189,7 @@ def main():
         print(f"Auto-detected platform: {platform}")
 
     if not args.models_only and not args.llm_only:
-        setup_binaries(platform)
+        setup_binaries(platform, use_cpu=args.cpu)
 
     if not args.binary_only:
         if args.llm_only:
